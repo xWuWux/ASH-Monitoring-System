@@ -1,0 +1,21 @@
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    bash \
+    inotify-tools \
+    diffutils \
+    kafkacat \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -r -u 1000 ash
+
+RUN mkdir -p /etc/ash /var/log/ash /tmp/ash
+RUN chown -R ash:ash /var/log/ash /tmp/ash
+
+COPY src/agent/ash-agent.sh /usr/local/bin/
+COPY src/common/config/ash.conf.example /etc/ash/ash.conf
+RUN chmod +x /usr/local/bin/ash-agent.sh
+
+USER ash
+
+CMD ["/usr/local/bin/ash-agent.sh"]
