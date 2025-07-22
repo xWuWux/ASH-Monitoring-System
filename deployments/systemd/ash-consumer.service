@@ -1,0 +1,17 @@
+[Unit]
+Description=ASH Kafka Consumer
+After=network.target kafka.service
+Wants=network.target
+Requires=kafka.service
+
+[Service]
+Type=simple
+User=ash
+Group=ash
+Environment=PYTHONPATH=/usr/local/lib/python3/dist-packages
+ExecStart=/usr/local/bin/ash-consumer.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
