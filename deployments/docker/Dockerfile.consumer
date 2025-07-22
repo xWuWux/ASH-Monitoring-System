@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+RUN pip install kafka-python psycopg2-binary
+
+RUN useradd -r -u 1000 ash
+
+RUN mkdir -p /etc/ash /var/log/ash
+RUN chown -R ash:ash /var/log/ash
+
+COPY src/consumer/ash-consumer.py /usr/local/bin/
+COPY src/common/config/consumer.conf.example /etc/ash/consumer.conf
+RUN chmod +x /usr/local/bin/ash-consumer.py
+
+USER ash
+
+CMD ["/usr/local/bin/ash-consumer.py"]
