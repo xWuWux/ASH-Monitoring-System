@@ -1,0 +1,12 @@
+{
+    "kafka_brokers": ["kafka1:9092", "kafka2:9092"],
+    "kafka_topic": "ash-logs",
+    "kafka_group_id": "ash-consumer-group",
+    "log_dir": "/var/log/ash",
+    "database_enabled": false,
+    "database_url": "postgresql://ash:password@localhost/ash_logs",
+    "log_level": "INFO",
+    "batch_size": 100,
+    "flush_interval": 5,
+    "retention_days": 90
+}
