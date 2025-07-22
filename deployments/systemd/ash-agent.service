@@ -4,8 +4,16 @@ After=network.target
 
 [Service]
 Type=forking
+User=ash
+Group=ash
+Environment=ASH_CONFIG_DIR=/etc/ash
+Environment=ASH_LOG_DIR=/var/log/ash
+ExecStartPre=/bin/mkdir -p /var/log/ash /tmp/ash
+ExecStartPre=/bin/chown ash:ash /var/log/ash /tmp/ash
 ExecStart=/usr/local/bin/ash-agent.sh
+ExecStop=/bin/kill -TERM $MAINPID
 Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
