@@ -1,0 +1,10 @@
+# ASH Agent Configuration Example
+
+ASH_LOG_DIR="/var/log/ash"
+ASH_TEMP_DIR="/tmp/ash"
+
+KAFKA_ENABLED=false
+KAFKA_BROKER="localhost:9092"
+KAFKA_TOPIC="ash-logs"
+
+# [REST OF CONFIG FROM YOUR DOCUMENT]
