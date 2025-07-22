@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  ash-agent:
+    build:
+      context: ../../src/agent
+      dockerfile: Dockerfile.agent
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    privileged: true
+
+  ash-consumer:
+    build:
+      context: ../../src/consumer
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
