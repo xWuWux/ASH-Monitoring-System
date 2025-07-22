@@ -1,0 +1,11 @@
+[Unit]
+Description=ASH Shell Monitoring Agent
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/ash-agent.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
