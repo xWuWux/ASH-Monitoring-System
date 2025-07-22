@@ -1,0 +1,30 @@
+# ASH Agent Configuration Example
+
+# Basic settings
+ASH_LOG_DIR = "/var/log/ash"
+ASH_TEMP_DIR = "/tmp/ash"
+
+# Kafka settings (for distributed mode)
+KAFKA_ENABLED = false
+KAFKA_BROKER = "localhost:9092"
+KAFKA_TOPIC = "ash-logs"
+
+# File monitoring
+WATCHED_FILES = (
+    "/etc/passwd"
+    "/etc/shadow"
+    "/etc/ssh/sshd_config"
+    "/etc/sudoers"
+)
+
+# Monitoring intervals (seconds)
+DIFF_MONITOR_INTERVAL = 30
+INOTIFY_ENABLED = true
+
+# Security
+FILTER_PASSWORDS = true
+EXCLUDE_COMMANDS = (
+    "^ssh "
+    "^mysql.*-p"
+    "^sudo.*passwd"
+)
