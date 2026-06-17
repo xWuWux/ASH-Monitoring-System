@@ -1,0 +1,16 @@
+# ASH Redaction Rules — Custom patterns
+# Format: regex_pattern|replacement
+# Uses Extended Regular Expression (ERE) syntax
+# Lines starting with # are comments
+
+# Database connection strings
+(mongodb|postgres|mysql|redis)://[^\s]+|\1://[REDACTED]
+
+# Internal API tokens
+(INTERNAL_TOKEN|APP_SECRET)[[:space:]]*=[[:space:]]*[^\s]+|\1=[REDACTED]
+
+# Kubernetes tokens
+(--token)[[:space:]]+[^\s]+|\1 [REDACTED]
+
+# Terraform/Vault secrets
+(vault_token|tf_token)[[:space:]]*=[[:space:]]*[^\s]+|\1=[REDACTED]

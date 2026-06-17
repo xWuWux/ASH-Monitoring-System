@@ -1,0 +1,27 @@
+{
+    "rules": [
+        {
+            "name": "Custom: Database Drop",
+            "pattern": "(DROP\\s+DATABASE|DROP\\s+TABLE)",
+            "severity": "critical",
+            "description": "Database destructive operation detected",
+            "actions": ["webhook", "log"],
+            "mitre": {
+                "technique": "T1485",
+                "tactic": "Impact"
+            },
+            "cooldown_seconds": 60
+        },
+        {
+            "name": "Custom: Mass File Deletion",
+            "pattern": "find\\s+.*-delete|xargs\\s+rm",
+            "severity": "high",
+            "description": "Mass file deletion pattern detected",
+            "actions": ["webhook", "log"],
+            "mitre": {
+                "technique": "T1485",
+                "tactic": "Impact"
+            }
+        }
+    ]
+}

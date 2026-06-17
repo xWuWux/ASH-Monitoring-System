@@ -1,16 +1,17 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-RUN pip install kafka-python psycopg2-binary
+RUN useradd -r -u 1000 -s /bin/false ash && \
+    mkdir -p /var/log/ash /var/archive/ash /etc/ash && \
+    chown -R ash:ash /var/log/ash /var/archive/ash
 
-RUN useradd -r -u 1000 ash
+COPY src/consumer/requirements.txt /tmp/
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-RUN mkdir -p /etc/ash /var/log/ash
-RUN chown -R ash:ash /var/log/ash
-
-COPY src/consumer/ash-consumer.py /usr/local/bin/
-COPY src/common/config/consumer.conf.example /etc/ash/consumer.conf
-RUN chmod +x /usr/local/bin/ash-consumer.py
+COPY src/consumer/ /usr/local/lib/ash/
+COPY config/consumer.conf.example /etc/ash/consumer.conf
+COPY config/alert_rules.json.example /etc/ash/alert_rules.json
 
 USER ash
+EXPOSE 9090
 
-CMD ["/usr/local/bin/ash-consumer.py"]
+CMD ["python3", "/usr/local/lib/ash/ash-consumer.py", "/etc/ash/consumer.conf"]

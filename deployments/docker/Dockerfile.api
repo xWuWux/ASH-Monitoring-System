@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+RUN useradd -r -u 1000 -s /bin/false ash && \
+    mkdir -p /var/log/ash && \
+    chown ash:ash /var/log/ash
+
+COPY src/consumer/requirements.txt /tmp/
+RUN pip install --no-cache-dir -r /tmp/requirements.txt && \
+    pip install --no-cache-dir flask pyjwt gunicorn
+
+COPY src/consumer/ /usr/local/lib/ash/
+
+USER ash
+EXPOSE 8080
+
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "4", "--timeout", "120", "api_server:app", "--chdir", "/usr/local/lib/ash"]

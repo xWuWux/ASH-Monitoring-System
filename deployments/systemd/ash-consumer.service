@@ -1,17 +1,25 @@
 [Unit]
-Description=ASH Kafka Consumer
-After=network.target kafka.service
-Wants=network.target
-Requires=kafka.service
+Description=ASH Kafka Consumer and Log Processor
+After=network.target kafka.service postgresql.service
+Wants=kafka.service postgresql.service
 
 [Service]
 Type=simple
 User=ash
 Group=ash
-Environment=PYTHONPATH=/usr/local/lib/python3/dist-packages
-ExecStart=/usr/local/bin/ash-consumer.py
+ExecStart=/usr/local/bin/ash-consumer /etc/ash/consumer.conf
 Restart=always
 RestartSec=10
+StartLimitBurst=3
+StartLimitIntervalSec=120
+
+Environment=PYTHONPATH=/usr/local/lib/python3/dist-packages
+
+# Security hardening
+ProtectSystem=strict
+ReadWritePaths=/var/log/ash /var/archive/ash
+PrivateTmp=true
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
