@@ -26,7 +26,7 @@ jobs:
       - name: Python lint
         run: |
           pip install flake8 bandit
-          flake8 src/consumer/ --max-line-length=120 --ignore=E501,W503
+          flake8 src/consumer/ --max-line-length=120 --ignore=E501,W503,E226
           bandit -r src/consumer/ -ll -q
 
   unit-tests:

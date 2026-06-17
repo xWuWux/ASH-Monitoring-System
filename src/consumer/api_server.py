@@ -4,17 +4,14 @@ ASH REST API Server — Search, analytics, and real-time streaming.
 Provides JWT-based authentication and RBAC.
 """
 
-import json
 import os
-import time
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Optional
 
 import jwt
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from flask import Flask, Response, jsonify, request, stream_with_context
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 app.config['JWT_SECRET'] = os.environ.get('ASH_JWT_SECRET', 'change-me-in-production')
@@ -294,7 +291,6 @@ def top_commands():
 def event_timeline():
     """Event frequency over time (bucketed)."""
     hours = min(int(request.args.get('hours', 24)), 720)
-    bucket_minutes = int(request.args.get('bucket', 60))
 
     conn = get_db()
     try:

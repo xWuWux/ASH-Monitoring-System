@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 from kafka import KafkaConsumer
-from kafka.errors import NoBrokersAvailable, KafkaError
+from kafka.errors import NoBrokersAvailable
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 
 
