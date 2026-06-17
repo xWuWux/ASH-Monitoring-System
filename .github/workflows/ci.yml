@@ -47,7 +47,12 @@ jobs:
           pip3 install kafka-python psycopg2-binary prometheus-client pytest flask pyjwt requests
 
       - name: Run BATS unit tests
-        run: timeout 10m bats tests/unit/ --tap
+        run: |
+          set -e
+          for test_file in tests/unit/*.bats; do
+            echo "===== Running ${test_file} ====="
+            timeout 90s bats --verbose-run "${test_file}"
+          done
 
       - name: Run Python unit tests
         run: pytest tests/unit/python/ -v 2>/dev/null || echo "No Python unit tests yet"
@@ -69,7 +74,12 @@ jobs:
           sudo apt-get install -y -qq jq inotify-tools uuid-runtime
 
       - name: Run regression tests
-        run: timeout 10m bats tests/regression/ --tap
+        run: |
+          set -e
+          for test_file in tests/regression/*.bats; do
+            echo "===== Running ${test_file} ====="
+            timeout 90s bats --verbose-run "${test_file}"
+          done
 
   integration-tests:
     runs-on: ubuntu-latest
