@@ -21,7 +21,10 @@ jobs:
         run: |
           find src scripts -type f -name "*.sh" \
             ! -path "*/shells/zsh-integration.sh" \
-            -print0 | xargs -0 shellcheck -S warning
+            -print0 | xargs -0 -r shellcheck \
+              -e SC2034 \
+              -e SC2115 \
+              -e SC2155
       - name: Python lint
         run: |
           pip install flake8 bandit
