@@ -1,0 +1,34 @@
+# ASH Monitoring — Kernel-level audit rules
+# Deploy to /etc/audit/rules.d/ash.rules
+# Reload with: augenrules --load
+
+# Track ALL command executions (execve syscall)
+-a always,exit -F arch=b64 -S execve -k ash_exec
+-a always,exit -F arch=b32 -S execve -k ash_exec
+
+# Critical file modifications
+-w /etc/passwd -p wa -k ash_passwd
+-w /etc/shadow -p wa -k ash_shadow
+-w /etc/sudoers -p wa -k ash_sudoers
+-w /etc/sudoers.d/ -p wa -k ash_sudoers_d
+-w /etc/ssh/sshd_config -p wa -k ash_sshd
+-w /root/.ssh/ -p wa -k ash_root_ssh
+-w /etc/crontab -p wa -k ash_crontab
+-w /etc/cron.d/ -p wa -k ash_cron_d
+-w /etc/systemd/system/ -p wa -k ash_systemd
+
+# User/group database modifications
+-w /etc/group -p wa -k ash_group
+-w /etc/gshadow -p wa -k ash_gshadow
+
+# PAM configuration
+-w /etc/pam.d/ -p wa -k ash_pam
+
+# Network configuration
+-w /etc/hosts -p wa -k ash_hosts
+-w /etc/resolv.conf -p wa -k ash_dns
+
+# Kernel modules
+-w /etc/modprobe.d/ -p wa -k ash_modules
+-a always,exit -F arch=b64 -S init_module -S finit_module -k ash_kernel_module
+-a always,exit -F arch=b64 -S delete_module -k ash_kernel_module

@@ -1,0 +1,18 @@
+{
+    "kafka_brokers": ["localhost:9092"],
+    "kafka_topic": "ash-logs",
+    "kafka_group_id": "ash-consumer-group",
+    "log_dir": "/var/log/ash",
+    "database_enabled": true,
+    "database_url": "postgresql://ash:secure_password@localhost/ash_logs",
+    "log_level": "INFO",
+    "batch_size": 100,
+    "batch_timeout": 5.0,
+    "retention_days": 90,
+    "archive_days": 30,
+    "archive_path": "/var/archive/ash",
+    "metrics_port": 9090,
+    "alerting_enabled": true,
+    "alert_rules_path": "/etc/ash/alert_rules.json",
+    "max_dedup_cache": 100000
+}

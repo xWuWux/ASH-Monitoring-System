@@ -1,0 +1,24 @@
+[Unit]
+Description=ASH REST API Server
+After=network.target postgresql.service ash-consumer.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=ash
+Group=ash
+ExecStart=/usr/bin/python3 /usr/local/lib/ash/api_server.py
+Restart=always
+RestartSec=5
+
+Environment=ASH_DATABASE_URL=postgresql://ash:password@localhost/ash_logs
+Environment=ASH_JWT_SECRET=change-me-in-production
+Environment=ASH_API_PORT=8080
+
+ProtectSystem=strict
+ReadWritePaths=/var/log/ash
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

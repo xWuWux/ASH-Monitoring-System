@@ -1,0 +1,42 @@
+# ─── ASH Agent Configuration ─────────────────────────────────────────────────
+# Copy to /etc/ash/ash.conf and customize
+
+# Directories
+ASH_LOG_DIR="/var/log/ash"
+ASH_TEMP_DIR="/tmp/ash"
+ASH_SPOOL_DIR="/var/spool/ash"
+ASH_SPOOL_MAX_SIZE="1073741824"  # 1GB max spool
+
+# ─── Kafka (Distributed Mode) ────────────────────────────────────────────────
+KAFKA_ENABLED=false
+KAFKA_BROKER="localhost:9092"
+KAFKA_TOPIC="ash-logs"
+
+# ─── Monitoring Layers ───────────────────────────────────────────────────────
+INOTIFY_ENABLED=true
+AUDITD_ENABLED=false
+DOCKER_MONITOR_ENABLED=false
+
+# ─── Watched Files (inotify real-time monitoring) ────────────────────────────
+WATCHED_FILES=(
+    "/etc/passwd"
+    "/etc/shadow"
+    "/etc/ssh/sshd_config"
+    "/etc/sudoers"
+    "/etc/hosts"
+    "/root/.ssh/authorized_keys"
+    "/etc/crontab"
+    "/etc/systemd/system"
+)
+
+# ─── Performance Tuning ──────────────────────────────────────────────────────
+MAX_COMMANDS_PER_SECOND=50
+MAX_OUTPUT_SIZE=1048576  # 1MB max captured output
+
+# ─── Security ────────────────────────────────────────────────────────────────
+# Commands matching these patterns will not be logged
+EXCLUDE_COMMANDS=(
+    "^log_command"
+    "^safe_log_write"
+    "^emit_event"
+)

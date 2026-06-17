@@ -1,0 +1,87 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://ash-monitor.dev/schema/event-v1.json",
+    "title": "ASH Event Schema v1.0",
+    "description": "Canonical JSON event schema for all ASH monitoring events",
+    "type": "object",
+    "required": ["event_id", "schema_version", "timestamp", "hostname", "source", "event_type"],
+    "properties": {
+        "event_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Unique identifier for this event"
+        },
+        "schema_version": {
+            "type": "string",
+            "const": "1.0"
+        },
+        "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 timestamp with millisecond precision"
+        },
+        "hostname": {
+            "type": "string",
+            "description": "FQDN or hostname of the monitored system"
+        },
+        "source": {
+            "type": "string",
+            "enum": [
+                "bash-debug", "bash-session", "bash-diff",
+                "auditd", "inotify", "fanotify",
+                "docker-events", "k8s-audit", "process-accounting"
+            ],
+            "description": "The monitoring layer that generated this event"
+        },
+        "event_type": {
+            "type": "string",
+            "enum": [
+                "command_start", "command_end",
+                "file_modify", "file_create", "file_delete", "file_move", "file_attrib",
+                "session_start", "session_end",
+                "privilege_escalation", "alert",
+                "container_start", "container_stop", "container_exec",
+                "container_die", "container_create", "container_destroy"
+            ],
+            "description": "Type of event"
+        },
+        "user": { "type": "string" },
+        "uid": { "type": "integer" },
+        "euid": { "type": "integer" },
+        "gid": { "type": "integer" },
+        "session_id": { "type": "string", "format": "uuid" },
+        "pid": { "type": "integer" },
+        "ppid": { "type": "integer" },
+        "pgrp": { "type": "integer" },
+        "tty": { "type": "string" },
+        "command": { "type": "string" },
+        "command_args": { "type": "array", "items": { "type": "string" } },
+        "cwd": { "type": "string" },
+        "shell": { "type": "string" },
+        "bash_subshell": { "type": "integer" },
+        "lineno": { "type": "integer" },
+        "exit_code": { "type": "integer" },
+        "signal": { "type": ["string", "null"] },
+        "duration_ms": { "type": "number" },
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" },
+        "output_truncated": { "type": "boolean" },
+        "file_path": { "type": ["string", "null"] },
+        "file_path_previous": { "type": ["string", "null"] },
+        "diff_content": { "type": ["string", "null"] },
+        "inotify_event": { "type": ["string", "null"] },
+        "ssh_connection": { "type": ["string", "null"] },
+        "ssh_tty": { "type": ["string", "null"] },
+        "container_id": { "type": ["string", "null"] },
+        "container_name": { "type": ["string", "null"] },
+        "container_image": { "type": ["string", "null"] },
+        "docker_action": { "type": ["string", "null"] },
+        "k8s_namespace": { "type": ["string", "null"] },
+        "k8s_pod": { "type": ["string", "null"] },
+        "audit_key": { "type": ["string", "null"] },
+        "risk_score": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "risk_flags": { "type": "array", "items": { "type": "string" } },
+        "prev_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "event_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+    }
+}
