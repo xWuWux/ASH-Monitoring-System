@@ -3,6 +3,17 @@
 # Production-grade shell activity monitoring with structured events,
 # tamper-evident logging, crash recovery, and multi-layer monitoring.
 
+# Captured before we change any shell options below, so a failed init can
+# restore the *caller's* original options (see the dispatch logic at the
+# bottom of this file). This matters because `set -e`, once enabled here,
+# stays enabled in whatever shell sourced this file — and empirically,
+# `set -e` being active in the caller at the moment this file's own
+# `source` statement finishes is enough to kill that caller's shell on a
+# non-zero return, even though nothing past this point calls `exit`
+# directly. Restoring the caller's pre-source options on a failure path
+# is the only way to prevent that retroactively.
+_ASH_CALLER_SHELL_OPTS=$(set +o)
+
 set -euo pipefail
 set -T  # functrace — inherit DEBUG/ERR traps into functions and subshells
 set -E  # errtrace — inherit ERR trap into functions and subshells
@@ -880,14 +891,26 @@ trap 'agent_log "ERROR" "Command failed at line $LINENO: $BASH_COMMAND"' ERR
 
 # ─── Main Initialization ─────────���──────────────────────────────────────────
 main() {
-    # Validate configuration
-    validate_config || exit 1
+    # Validate configuration.
+    #
+    # `return` (not `exit`) on failure: this function runs both when
+    # ash-agent is executed as its own process (fine to exit — see the
+    # dispatch logic below) and when it is `source`d directly into a
+    # user's interactive login shell via /etc/profile.d/ash.sh. In the
+    # latter case `exit` would terminate the *user's shell*, not just
+    # monitoring — e.g. the stock install.sh directory permissions
+    # (/tmp/ash root:root 700, /var/log/ash root:ash 750 — group has no
+    # write bit) fail this check for every non-root, non-`ash` user,
+    # which meant every such user's login shell used to die immediately.
+    # Returning here just leaves monitoring disabled for the session
+    # instead.
+    validate_config || return 1
 
     # Initialize subsystems
     load_redaction_rules
     hash_chain_init
     spool_init
-    recover_state || exit 1
+    recover_state || return 1
 
     # Save current state
     save_state
@@ -928,10 +951,35 @@ main() {
 if [[ "${1:-}" == "--functions-only" ]]; then
     :
 elif [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # Executed directly (e.g. systemd's ExecStart=/usr/local/bin/ash-agent)
+    # rather than sourced: this is our own process, so it's fine (and, via
+    # `set -e`, automatic) for a main() failure to exit it.
     export BASH_ENV="${BASH_SOURCE[0]}"
     main "$@"
 elif [[ "${ASH_INITIALIZED:-}" != "true" ]]; then
     export ASH_INITIALIZED="true"
     export BASH_ENV="${BASH_SOURCE[0]}"
-    main "$@"
+    # Sourced into someone else's shell (interactive login, or a child
+    # bash process via BASH_ENV). On failure, restore the caller's
+    # original shell options (captured as _ASH_CALLER_SHELL_OPTS before
+    # `set -euo pipefail` above) before returning.
+    #
+    # This is not optional polish: `main() { ... return 1; }` alone is
+    # NOT enough to save the caller, even though it looks like it should
+    # be. Confirmed empirically (see issue tracker) — because `set -e`
+    # was enabled by *this* file and never undone, it is still active in
+    # the caller by the time `main "$@"` finishes, and bash checks
+    # errexit against a command's exit status using whatever option
+    # state is active at that check, not the state that was active when
+    # the command started. So a bare `main "$@" || return 1` here would
+    # still trip the caller's (now-enabled) errexit on main's non-zero
+    # return, even though nothing calls `exit` anymore. Restoring the
+    # caller's original options first removes that trap; if the caller
+    # already had errexit on for their own reasons, this restores that
+    # too, so we're not silently overriding an intentional caller
+    # setting — just not leaving one behind that they didn't ask for.
+    if ! main "$@"; then
+        eval "$_ASH_CALLER_SHELL_OPTS" 2>/dev/null || true
+        return 1
+    fi
 fi
