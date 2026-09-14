@@ -1,4 +1,8 @@
-kafka-python>=2.0.2
+# kafka-python 3.x removed kafka.errors.NoBrokersAvailable (used in
+# ash-consumer.py), so an unpinned upper bound resolves to a version that
+# fails to import at all on a fresh `pip install`. Pinned to the 2.x
+# series until the consumer is migrated to the 3.x API.
+kafka-python>=2.0.2,<3.0.0
 psycopg2-binary>=2.9.9
 prometheus-client>=0.20.0
 requests>=2.31.0

@@ -43,6 +43,11 @@ EVENTS_DEDUPLICATED = Counter(
     'ash_consumer_events_deduplicated_total',
     'Total duplicate events skipped'
 )
+EVENTS_DEAD_LETTERED = Counter(
+    'ash_consumer_events_dead_lettered_total',
+    'Total events written to the dead-letter queue instead of being processed',
+    ['reason']
+)
 BATCH_FLUSH_LATENCY = Histogram(
     'ash_consumer_batch_flush_seconds',
     'Batch flush latency',
@@ -78,6 +83,18 @@ VALID_EVENT_TYPES = [
     'container_die', 'container_create', 'container_destroy'
 ]
 
+# Maps an AlertRule's severity to the 0-10 risk_score range defined in
+# src/common/schema/event-v1.json. Feeds matched-rule severity back onto
+# the event before it is batched, so risk_score (indexed, and the sole
+# filter on GET /api/v1/stats/risky) is actually populated — previously
+# nothing ever assigned it and it stayed at its DEFAULT 0 for every row.
+SEVERITY_RISK_SCORE = {
+    'critical': 10,
+    'high': 7,
+    'medium': 4,
+    'low': 2,
+}
+
 
 class ASHConsumer:
     """Production-grade ASH event consumer with resilience patterns."""
@@ -101,6 +118,19 @@ class ASHConsumer:
         # Storage
         self.log_dir = Path(self.config.get('log_dir', '/var/log/ash'))
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Dead-letter queue: events that fail schema validation were
+        # previously logged at WARNING and silently discarded. Route them
+        # here instead so nothing is lost without a trace and an operator
+        # can inspect/replay them.
+        self.dlq_path = self.log_dir / 'dead_letter.jsonl'
+
+        # Set by _flush_batch() (which can run on this thread or the
+        # background flush-timer thread) whenever it durably writes a
+        # batch; only ever *read and cleared* on the main consumer-loop
+        # thread, which is the only thread allowed to call
+        # self.consumer.commit() — KafkaConsumer is not thread-safe.
+        self._commit_pending = threading.Event()
 
         # Database
         self.db_conn: Optional[psycopg2.extensions.connection] = None
@@ -326,7 +356,15 @@ class ASHConsumer:
                     group_id=self.config['kafka_group_id'],
                     value_deserializer=lambda x: json.loads(x.decode('utf-8')),
                     auto_offset_reset='latest',
-                    enable_auto_commit=True,
+                    # Was True: offsets were committed on a fixed
+                    # background timer regardless of whether the consumed
+                    # events had actually been flushed to file/DB yet.
+                    # A crash between poll and flush silently lost up to
+                    # batch_size - 1 events, since Kafka would never
+                    # redeliver an already-committed offset. Commits are
+                    # now issued explicitly, only after a flush succeeds
+                    # (see run()).
+                    enable_auto_commit=False,
                     max_poll_interval_ms=300000,
                     session_timeout_ms=30000,
                     heartbeat_interval_ms=10000,
@@ -350,6 +388,21 @@ class ASHConsumer:
                 return False
         return True
 
+    def _write_dead_letter(self, event: Dict[str, Any], reason: str):
+        """Persist an event that could not be processed instead of
+        silently dropping it, so it can be inspected/replayed later."""
+        EVENTS_DEAD_LETTERED.labels(reason=reason).inc()
+        try:
+            record = {
+                'dlq_timestamp': datetime.utcnow().isoformat() + 'Z',
+                'reason': reason,
+                'event': event,
+            }
+            with open(self.dlq_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, default=str) + '\n')
+        except Exception as e:
+            self.logger.error(f"Failed to write dead-letter record: {e}")
+
     def _deduplicate(self, event_id: str) -> bool:
         if event_id in self.seen_event_ids:
             EVENTS_DEDUPLICATED.inc()
@@ -366,6 +419,7 @@ class ASHConsumer:
         try:
             if not self._validate_event(log_data):
                 self.logger.warning(f"Invalid event schema: {log_data.get('event_id', 'unknown')}")
+                self._write_dead_letter(log_data, 'missing_field')
                 return
 
             event_id = log_data.get('event_id', '')
@@ -377,9 +431,15 @@ class ASHConsumer:
             event_type = log_data.get('event_type', 'unknown')
             EVENTS_RECEIVED.labels(source=source, event_type=event_type).inc()
 
-            # Alerting
+            # Alerting — feed matched-rule severity back into risk_score
+            # (see SEVERITY_RISK_SCORE) so it's actually non-zero for
+            # anything the alert engine flagged.
             if self.alert_engine:
-                self.alert_engine.check_event(log_data)
+                matched_rules = self.alert_engine.check_event(log_data)
+                if matched_rules:
+                    log_data['risk_score'] = max(
+                        SEVERITY_RISK_SCORE.get(rule.severity, 0) for rule in matched_rules
+                    )
 
             # Add to batch buffer
             with self.batch_lock:
@@ -413,6 +473,12 @@ class ASHConsumer:
 
             self.last_flush = time.time()
             EVENTS_PROCESSED.inc(len(batch))
+            # Signal the main consumer-loop thread that it's now safe to
+            # advance committed Kafka offsets past these events (they are
+            # durably on disk / in the DB). Set here so this covers both
+            # a size-triggered flush (this thread) and a timeout-triggered
+            # flush from the background flush-timer thread.
+            self._commit_pending.set()
 
         except Exception as e:
             self.logger.error(f"Batch flush failed: {e}")
@@ -507,6 +573,40 @@ class ASHConsumer:
                             template="""(%s, %s, %s, %s, %s, %s, %s, %s::uuid, %s, %s,
                                          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                          %s, %s, %s, %s::jsonb, %s::timestamp)"""
+                        )
+
+                    # Bulk insert file-change events. This table existed
+                    # (created, indexed, retention-pruned, VACUUMed) but
+                    # nothing ever inserted into it — file_events was
+                    # collected above and then silently discarded, so
+                    # every query against file_changes always returned
+                    # empty despite "file change tracking" being a
+                    # headline feature.
+                    if file_events:
+                        file_values = [
+                            (
+                                e.get('event_id'),
+                                e.get('hostname', 'unknown'),
+                                e.get('user', e.get('username', '')),
+                                e.get('session_id'),
+                                e.get('file_path'),
+                                e.get('event_type'),
+                                e.get('diff_content'),
+                                e.get('command', ''),
+                                e.get('source', 'unknown'),
+                                e.get('timestamp'),
+                            )
+                            for e in file_events
+                        ]
+                        execute_values(
+                            cursor,
+                            """INSERT INTO file_changes
+                            (event_id, hostname, username, session_id, file_path,
+                             change_type, diff_content, command, source, timestamp)
+                            VALUES %s
+                            ON CONFLICT (event_id) DO NOTHING""",
+                            file_values,
+                            template="""(%s, %s, %s, %s::uuid, %s, %s, %s, %s, %s, %s::timestamp)"""
                         )
 
                     # Handle sessions
@@ -629,6 +729,17 @@ class ASHConsumer:
                     break
                 self.process_message(message.value)
 
+                # Commit only from this thread (KafkaConsumer.commit() is
+                # not thread-safe) and only once a flush has actually
+                # persisted data — see enable_auto_commit=False above and
+                # the _commit_pending.set() calls in _flush_batch().
+                if self._commit_pending.is_set():
+                    try:
+                        self.consumer.commit()
+                        self._commit_pending.clear()
+                    except Exception as e:
+                        self.logger.error(f"Offset commit failed: {e}")
+
         except KeyboardInterrupt:
             self.logger.info("Consumer interrupted by user")
         except Exception as e:
@@ -645,6 +756,15 @@ class ASHConsumer:
         with self.batch_lock:
             if self.batch_buffer:
                 self._flush_batch()
+
+        # Commit the final flush's offsets before closing — same thread
+        # as run()'s loop (called from its `finally`), so this is safe.
+        if hasattr(self, 'consumer') and self._commit_pending.is_set():
+            try:
+                self.consumer.commit()
+                self._commit_pending.clear()
+            except Exception as e:
+                self.logger.error(f"Final offset commit failed: {e}")
 
         if hasattr(self, 'consumer'):
             self.consumer.close()
