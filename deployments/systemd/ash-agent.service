@@ -29,8 +29,13 @@ Environment=ASH_SPOOL_DIR=/var/spool/ash
 ProtectSystem=strict
 ReadWritePaths=/var/log/ash /var/spool/ash /tmp/ash /var/log/audit
 PrivateTmp=false
-NoNewPrivileges=false
-CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_AUDIT_READ CAP_SYS_PTRACE
+NoNewPrivileges=true
+# CAP_SYS_PTRACE was previously granted here but nothing in ash-agent.sh
+# uses ptrace; dropped per least-privilege (it would let a compromised
+# agent process attach to and read/write arbitrary other processes'
+# memory, which is well beyond what auditd-tailing/inotify/hash-chaining
+# require).
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_AUDIT_READ
 
 [Install]
 WantedBy=multi-user.target

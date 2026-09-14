@@ -38,7 +38,7 @@ services:
     environment:
       POSTGRES_DB: ash_logs
       POSTGRES_USER: ash
-      POSTGRES_PASSWORD: ${ASH_DB_PASSWORD:-secure_password}
+      POSTGRES_PASSWORD: ${ASH_DB_PASSWORD:?Set ASH_DB_PASSWORD (see .env.example) — no default is provided}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
@@ -59,7 +59,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      ASH_DATABASE_URL: postgresql://ash:${ASH_DB_PASSWORD:-secure_password}@postgres/ash_logs
+      ASH_DATABASE_URL: postgresql://ash:${ASH_DB_PASSWORD:?Set ASH_DB_PASSWORD (see .env.example) — no default is provided}@postgres/ash_logs
       ASH_KAFKA_BROKERS: kafka:29092
     volumes:
       - ash_logs:/var/log/ash
@@ -81,8 +81,8 @@ services:
     ports:
       - "8080:8080"
     environment:
-      ASH_DATABASE_URL: postgresql://ash:${ASH_DB_PASSWORD:-secure_password}@postgres/ash_logs
-      ASH_JWT_SECRET: ${ASH_JWT_SECRET:-change-me-in-production}
+      ASH_DATABASE_URL: postgresql://ash:${ASH_DB_PASSWORD:?Set ASH_DB_PASSWORD (see .env.example) — no default is provided}@postgres/ash_logs
+      ASH_JWT_SECRET: ${ASH_JWT_SECRET:?Set ASH_JWT_SECRET (see .env.example) — the old default was a publicly-known literal that let anyone forge admin tokens}
       ASH_API_PORT: "8080"
     restart: unless-stopped
     healthcheck:

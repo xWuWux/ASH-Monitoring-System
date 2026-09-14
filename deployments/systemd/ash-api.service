@@ -11,9 +11,21 @@ ExecStart=/usr/bin/python3 /usr/local/lib/ash/api_server.py
 Restart=always
 RestartSec=5
 
+# Placeholder default; override by adding ASH_DATABASE_URL to
+# /etc/ash/api.env once Postgres is provisioned (install.sh cannot
+# generate this safely on its own since it does not create the Postgres
+# role) — EnvironmentFile= below is listed after these Environment= lines
+# so a value set in api.env takes precedence, per systemd's file-order
+# override rules.
 Environment=ASH_DATABASE_URL=postgresql://ash:password@localhost/ash_logs
-Environment=ASH_JWT_SECRET=change-me-in-production
 Environment=ASH_API_PORT=8080
+# ASH_JWT_SECRET and ASH_ADMIN_PASS are generated at install time into
+# /etc/ash/api.env (see scripts/install.sh: generate_api_secrets) instead
+# of being committed here with a fixed, publicly-known value — the
+# previous "change-me-in-production" literal was a real credential once
+# deployed as-is, since it matches the source-visible default in
+# api_server.py and would let anyone forge admin JWTs.
+EnvironmentFile=-/etc/ash/api.env
 
 ProtectSystem=strict
 ReadWritePaths=/var/log/ash

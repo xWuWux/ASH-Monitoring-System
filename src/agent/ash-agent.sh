@@ -169,21 +169,27 @@ load_redaction_rules() {
         '(password|passwd|pwd|passphrase)[[:space:]]*=[[:space:]]*[^[:space:];|&]+'
         '(-p|--password|--pass)[[:space:]]+[^[:space:];|&]+'
         '(Authorization:[[:space:]]*Bearer)[[:space:]]+[^[:space:];|&]+'
+        '(Authorization:[[:space:]]*Basic)[[:space:]]+[^[:space:];|&]+'
         '(api_key|apikey|api-key|token|secret_key|access_key)[[:space:]]*=[[:space:]]*[^[:space:];|&]+'
         '(mysql|mysqldump)[[:space:]]+[^[:space:]]*-p[^[:space:]]*'
         'AKIA[A-Z0-9]{16}'
         '-----BEGIN[[:space:]]+(RSA|DSA|EC|OPENSSH)[[:space:]]+PRIVATE[[:space:]]+KEY-----'
+        '-----BEGIN[[:space:]]+PRIVATE[[:space:]]+KEY-----'
         'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
+        '([a-zA-Z][a-zA-Z0-9+.-]*://[^:/[:space:]@]+):[^@[:space:]]+@'
     )
     REDACTION_REPLACEMENTS+=(
         '\1=[REDACTED]'
+        '\1 [REDACTED]'
         '\1 [REDACTED]'
         '\1 [REDACTED]'
         '\1=[REDACTED]'
         '\1 -p[REDACTED]'
         'AKIA[REDACTED]'
         '-----BEGIN [REDACTED] PRIVATE KEY-----'
+        '-----BEGIN [REDACTED] PRIVATE KEY-----'
         '[JWT_REDACTED]'
+        '\1:[REDACTED]@'
     )
 
     # Load user-defined rules
@@ -202,7 +208,16 @@ redact_sensitive_data() {
     local output="${input}"
 
     for i in "${!REDACTION_PATTERNS[@]}"; do
-        output=$(echo "$output" | sed -E "s/${REDACTION_PATTERNS[$i]}/${REDACTION_REPLACEMENTS[$i]}/gI" 2>/dev/null || echo "$output")
+        # sed's `s/pattern/replacement/` uses '/' as the delimiter. Patterns
+        # matching URLs (e.g. `scheme://user:pass@host`) contain literal '/'
+        # characters that would otherwise be misread as extra delimiters,
+        # silently corrupting the substitution (and — via the `|| echo
+        # "$output"` fallback below — silently skipping redaction entirely
+        # instead of failing loudly). Escape '/' in both pattern and
+        # replacement before building the sed command.
+        local pat="${REDACTION_PATTERNS[$i]//\//\\/}"
+        local rep="${REDACTION_REPLACEMENTS[$i]//\//\\/}"
+        output=$(echo "$output" | sed -E "s/${pat}/${rep}/gI" 2>/dev/null || echo "$output")
     done
     echo "$output"
 }
@@ -413,6 +428,18 @@ emit_event() {
         fi
     else
         event="{\"event_id\":\"$event_id\",\"schema_version\":\"1.0\",\"timestamp\":\"$timestamp\",\"hostname\":\"$hostname\",\"source\":\"bash-debug\",\"event_type\":\"$event_type\",\"user\":\"$user\",\"uid\":$uid,\"session_id\":\"$session_id\",\"pid\":$pid,\"ppid\":$ppid,\"tty\":\"$tty\",\"cwd\":\"$cwd\",\"ssh_connection\":\"$ASH_SSH_CONNECTION\"}"
+
+        # Merge extra fields (non-jq fallback). Without this, every
+        # event-specific field built by callers (command, file_path,
+        # diff_content, exit_code, ...) was silently dropped whenever jq
+        # is unavailable — and jq is only an optional dependency per
+        # install.sh, so this path is reachable in production. Splice the
+        # extra object's members in by trimming the base object's trailing
+        # '}' and the extra object's leading '{', matching the same
+        # delimiter-splicing approach already used in hash_chain_append().
+        if [[ -n "$extra_fields" ]]; then
+            event="${event%\}},${extra_fields#\{}"
+        fi
     fi
 
     # Hash chain signing
@@ -535,6 +562,11 @@ track_file_changes() {
 
 check_pending_file_changes() {
     local cmd="${1:-unknown}"
+    # Redact before this ever leaves the process — file-change events were
+    # previously emitted with the raw, unredacted command line (see
+    # emit_file_event below), bypassing the same redaction applied to
+    # command_start events.
+    cmd=$(redact_sensitive_data "$cmd")
 
     for entry in "${ASH_PENDING_SNAPSHOTS[@]:-}"; do
         [[ -z "$entry" ]] && continue
@@ -546,6 +578,10 @@ check_pending_file_changes() {
         elif ! diff -q "${snapshot}" "${file_path}" >/dev/null 2>&1; then
             local diff_content
             diff_content=$(diff -u "${snapshot}" "${file_path}" 2>/dev/null | head -c 10240 || true)
+            # The diff body itself can contain the exact secret bytes that
+            # were written to the file (e.g. `echo "API_KEY=..." >> file`);
+            # redact it the same way the command line is redacted.
+            diff_content=$(redact_sensitive_data "$diff_content")
             emit_file_event "file_modify" "${file_path}" "" "${cmd}" "${diff_content}"
         fi
         rm -f "${snapshot}"
@@ -878,13 +914,24 @@ main() {
     agent_log "INFO" "ASH agent v${ASH_VERSION} started on $(hostname) (session: ${ASH_SESSION_ID})"
 }
 
-# Export for subshells
-export BASH_ENV="${BASH_SOURCE[0]}"
-
-# Run if sourced or executed
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# Run if sourced or executed.
+#
+# --functions-only: honored by src/agent/shells/zsh-integration.sh (and any
+# other non-bash shell integration), which only wants the portable helper
+# functions defined above (redact_sensitive_data, emit_event, hash chain,
+# spool, ...) without bash-only side effects — the DEBUG trap,
+# PROMPT_COMMAND, BASH_ENV propagation into child processes, or the
+# background watchers, all of which the zsh integration sets up itself via
+# preexec/precmd. Previously this flag was accepted by the caller but never
+# implemented here, so sourcing from zsh silently ran the full bash-only
+# main() anyway.
+if [[ "${1:-}" == "--functions-only" ]]; then
+    :
+elif [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    export BASH_ENV="${BASH_SOURCE[0]}"
     main "$@"
 elif [[ "${ASH_INITIALIZED:-}" != "true" ]]; then
     export ASH_INITIALIZED="true"
+    export BASH_ENV="${BASH_SOURCE[0]}"
     main "$@"
 fi
