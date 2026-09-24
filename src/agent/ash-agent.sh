@@ -32,8 +32,13 @@ ASH_EVENTS_FILE="${ASH_LOG_DIR}/events.jsonl"
 ASH_REDACTION_CONFIG="${ASH_CONFIG_DIR}/redaction_rules.conf"
 
 KAFKA_ENABLED="${KAFKA_ENABLED:-false}"
-KAFKA_BROKER="${KAFKA_BROKER:-localhost:9092}"
-KAFKA_TOPIC="${KAFKA_TOPIC:-ash-logs}"
+# No colon: default only when truly unset. An operator (or a validation
+# test) explicitly setting KAFKA_BROKER/KAFKA_TOPIC to "" to represent
+# "not configured" must stay empty here, or validate_config's "KAFKA_ENABLED
+# but broker/topic is empty" check below can never fire -- ${VAR:-default}
+# would silently replace that empty string with the default first.
+KAFKA_BROKER="${KAFKA_BROKER-localhost:9092}"
+KAFKA_TOPIC="${KAFKA_TOPIC-ash-logs}"
 
 INOTIFY_ENABLED="${INOTIFY_ENABLED:-true}"
 AUDITD_ENABLED="${AUDITD_ENABLED:-false}"
@@ -237,7 +242,12 @@ redact_sensitive_data() {
 hash_chain_init() {
     if [[ ! -f "${ASH_HASH_FILE}" ]]; then
         echo "0000000000000000000000000000000000000000000000000000000000000000" > "${ASH_HASH_FILE}"
-        chmod 400 "${ASH_HASH_FILE}" 2>/dev/null || true
+        # 600, not 400: hash_chain_append() must keep appending to this file
+        # for the life of the process. 400 (no write bit, even for the
+        # owner) blocks that on every non-root run and only ever "worked"
+        # because DAC checks don't apply to root, which is how this agent
+        # has always been deployed so far (see deployments/systemd/*).
+        chmod 600 "${ASH_HASH_FILE}" 2>/dev/null || true
     fi
 }
 

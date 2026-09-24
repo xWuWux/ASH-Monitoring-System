@@ -11,7 +11,11 @@ setup() {
     mkdir -p "$ASH_LOG_DIR" "$ASH_TEMP_DIR" "$ASH_SPOOL_DIR" "$ASH_CONFIG_DIR"
     mkdir -p "$ASH_SPOOL_DIR/pending" "$ASH_SPOOL_DIR/sent"
 
-    source "${BATS_TEST_DIRNAME}/../../src/agent/ash-agent.sh" 2>/dev/null || true
+    # --functions-only: define the hash-chain functions without running
+    # main() (background watchers, DEBUG trap, PROMPT_COMMAND, ...) inside
+    # the BATS runner's own shell -- that's what was hanging this file.
+    source "${BATS_TEST_DIRNAME}/../../src/agent/ash-agent.sh" --functions-only 2>/dev/null || true
+    trap - DEBUG RETURN ERR EXIT 2>/dev/null || true
 }
 
 teardown() {
