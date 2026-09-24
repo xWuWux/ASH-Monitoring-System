@@ -23,59 +23,68 @@ from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 
-
 # ─── Prometheus Metrics ──────────────────────────────────────────────────────
 EVENTS_RECEIVED = Counter(
-    'ash_consumer_events_received_total',
-    'Total events received from Kafka',
-    ['source', 'event_type']
+    "ash_consumer_events_received_total",
+    "Total events received from Kafka",
+    ["source", "event_type"],
 )
 EVENTS_PROCESSED = Counter(
-    'ash_consumer_events_processed_total',
-    'Total events successfully processed'
+    "ash_consumer_events_processed_total", "Total events successfully processed"
 )
 EVENTS_FAILED = Counter(
-    'ash_consumer_events_failed_total',
-    'Total events that failed processing',
-    ['reason']
+    "ash_consumer_events_failed_total",
+    "Total events that failed processing",
+    ["reason"],
 )
 EVENTS_DEDUPLICATED = Counter(
-    'ash_consumer_events_deduplicated_total',
-    'Total duplicate events skipped'
+    "ash_consumer_events_deduplicated_total", "Total duplicate events skipped"
 )
 BATCH_FLUSH_LATENCY = Histogram(
-    'ash_consumer_batch_flush_seconds',
-    'Batch flush latency',
-    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    "ash_consumer_batch_flush_seconds",
+    "Batch flush latency",
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
 )
 DB_WRITE_LATENCY = Histogram(
-    'ash_consumer_db_write_seconds',
-    'Database write latency',
-    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    "ash_consumer_db_write_seconds",
+    "Database write latency",
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
 )
-KAFKA_LAG = Gauge(
-    'ash_consumer_kafka_lag',
-    'Kafka consumer lag (estimated)'
-)
-BATCH_SIZE_GAUGE = Gauge(
-    'ash_consumer_batch_buffer_size',
-    'Current batch buffer size'
-)
+KAFKA_LAG = Gauge("ash_consumer_kafka_lag", "Kafka consumer lag (estimated)")
+BATCH_SIZE_GAUGE = Gauge("ash_consumer_batch_buffer_size", "Current batch buffer size")
 
 
 # ─── Event Schema Validation ─────────────────────────────────────────────────
-REQUIRED_FIELDS = ['event_id', 'timestamp', 'hostname', 'source', 'event_type']
+REQUIRED_FIELDS = ["event_id", "timestamp", "hostname", "source", "event_type"]
 VALID_SOURCES = [
-    'bash-debug', 'bash-session', 'bash-diff', 'auditd',
-    'inotify', 'fanotify', 'docker-events', 'k8s-audit',
-    'process-accounting'
+    "bash-debug",
+    "bash-session",
+    "bash-diff",
+    "auditd",
+    "inotify",
+    "fanotify",
+    "docker-events",
+    "k8s-audit",
+    "process-accounting",
 ]
 VALID_EVENT_TYPES = [
-    'command_start', 'command_end', 'file_modify', 'file_create',
-    'file_delete', 'file_move', 'file_attrib', 'session_start',
-    'session_end', 'privilege_escalation', 'alert',
-    'container_start', 'container_stop', 'container_exec',
-    'container_die', 'container_create', 'container_destroy'
+    "command_start",
+    "command_end",
+    "file_modify",
+    "file_create",
+    "file_delete",
+    "file_move",
+    "file_attrib",
+    "session_start",
+    "session_end",
+    "privilege_escalation",
+    "alert",
+    "container_start",
+    "container_stop",
+    "container_exec",
+    "container_die",
+    "container_create",
+    "container_destroy",
 ]
 
 
@@ -89,42 +98,43 @@ class ASHConsumer:
 
         # Deduplication
         self.seen_event_ids: set = set()
-        self.max_seen_ids: int = self.config.get('max_dedup_cache', 100000)
+        self.max_seen_ids: int = self.config.get("max_dedup_cache", 100000)
 
         # Batch processing
         self.batch_buffer: List[Dict] = []
-        self.batch_size: int = self.config.get('batch_size', 100)
-        self.batch_timeout: float = self.config.get('batch_timeout', 5.0)
+        self.batch_size: int = self.config.get("batch_size", 100)
+        self.batch_timeout: float = self.config.get("batch_timeout", 5.0)
         self.last_flush: float = time.time()
         self.batch_lock = threading.Lock()
 
         # Storage
-        self.log_dir = Path(self.config.get('log_dir', '/var/log/ash'))
+        self.log_dir = Path(self.config.get("log_dir", "/var/log/ash"))
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         # Database
         self.db_conn: Optional[psycopg2.extensions.connection] = None
-        if self.config.get('database_enabled', False):
+        if self.config.get("database_enabled", False):
             self._setup_database()
 
         # Kafka
         self._setup_kafka_consumer()
 
         # Alerting
-        self.alert_engine: Optional['ASHAlertEngine'] = None
-        if self.config.get('alerting_enabled', False):
+        self.alert_engine: Optional["ASHAlertEngine"] = None
+        if self.config.get("alerting_enabled", False):
             from ash_alerting import ASHAlertEngine
+
             self.alert_engine = ASHAlertEngine(
-                self.config.get('alert_rules_path', '/etc/ash/alert_rules.json')
+                self.config.get("alert_rules_path", "/etc/ash/alert_rules.json")
             )
 
         # Retention
-        self.retention_days: int = self.config.get('retention_days', 90)
-        self.archive_days: int = self.config.get('archive_days', 30)
-        self.archive_path = Path(self.config.get('archive_path', '/var/archive/ash'))
+        self.retention_days: int = self.config.get("retention_days", 90)
+        self.archive_days: int = self.config.get("archive_days", 30)
+        self.archive_path = Path(self.config.get("archive_path", "/var/archive/ash"))
 
         # Metrics server
-        metrics_port = self.config.get('metrics_port', 9090)
+        metrics_port = self.config.get("metrics_port", 9090)
         try:
             start_http_server(metrics_port)
             self.logger.info(f"Prometheus metrics server on port {metrics_port}")
@@ -143,58 +153,57 @@ class ASHConsumer:
 
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         default_config = {
-            'kafka_brokers': ['localhost:9092'],
-            'kafka_topic': 'ash-logs',
-            'kafka_group_id': 'ash-consumer-group',
-            'log_dir': '/var/log/ash',
-            'database_enabled': False,
-            'database_url': 'postgresql://ash:password@localhost/ash_logs',
-            'log_level': 'INFO',
-            'batch_size': 100,
-            'batch_timeout': 5.0,
-            'retention_days': 90,
-            'archive_days': 30,
-            'archive_path': '/var/archive/ash',
-            'metrics_port': 9090,
-            'alerting_enabled': False,
-            'alert_rules_path': '/etc/ash/alert_rules.json',
-            'max_dedup_cache': 100000,
+            "kafka_brokers": ["localhost:9092"],
+            "kafka_topic": "ash-logs",
+            "kafka_group_id": "ash-consumer-group",
+            "log_dir": "/var/log/ash",
+            "database_enabled": False,
+            "database_url": "postgresql://ash:password@localhost/ash_logs",
+            "log_level": "INFO",
+            "batch_size": 100,
+            "batch_timeout": 5.0,
+            "retention_days": 90,
+            "archive_days": 30,
+            "archive_path": "/var/archive/ash",
+            "metrics_port": 9090,
+            "alerting_enabled": False,
+            "alert_rules_path": "/etc/ash/alert_rules.json",
+            "max_dedup_cache": 100000,
         }
 
         if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 config = json.load(f)
                 default_config.update(config)
 
         return default_config
 
     def _setup_logging(self):
-        log_level = getattr(logging, self.config.get('log_level', 'INFO'))
+        log_level = getattr(logging, self.config.get("log_level", "INFO"))
         logging.basicConfig(
             level=log_level,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
             handlers=[
                 logging.FileHandler(
-                    str(self.log_dir / 'consumer.log'),
-                    encoding='utf-8'
+                    str(self.log_dir / "consumer.log"), encoding="utf-8"
                 ),
-                logging.StreamHandler()
-            ]
+                logging.StreamHandler(),
+            ],
         )
-        self.logger = logging.getLogger('ash-consumer')
+        self.logger = logging.getLogger("ash-consumer")
 
     def _setup_database(self):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                self.db_conn = psycopg2.connect(self.config['database_url'])
+                self.db_conn = psycopg2.connect(self.config["database_url"])
                 self.db_conn.autocommit = False
                 self._create_tables()
                 self.logger.info("Database connection established")
                 return
             except Exception as e:
                 self.logger.error(f"Database setup attempt {attempt+1} failed: {e}")
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
 
         self.logger.error("Database setup failed after all retries")
         self.db_conn = None
@@ -321,11 +330,11 @@ class ASHConsumer:
         for attempt in range(max_retries):
             try:
                 self.consumer = KafkaConsumer(
-                    self.config['kafka_topic'],
-                    bootstrap_servers=self.config['kafka_brokers'],
-                    group_id=self.config['kafka_group_id'],
-                    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-                    auto_offset_reset='latest',
+                    self.config["kafka_topic"],
+                    bootstrap_servers=self.config["kafka_brokers"],
+                    group_id=self.config["kafka_group_id"],
+                    value_deserializer=lambda x: json.loads(x.decode("utf-8")),
+                    auto_offset_reset="latest",
                     enable_auto_commit=True,
                     max_poll_interval_ms=300000,
                     session_timeout_ms=30000,
@@ -334,7 +343,9 @@ class ASHConsumer:
                 self.logger.info("Kafka consumer initialized")
                 return
             except NoBrokersAvailable:
-                self.logger.warning(f"Kafka not available, attempt {attempt+1}/{max_retries}")
+                self.logger.warning(
+                    f"Kafka not available, attempt {attempt+1}/{max_retries}"
+                )
                 time.sleep(5 * (attempt + 1))
             except Exception as e:
                 self.logger.error(f"Kafka setup error: {e}")
@@ -346,7 +357,7 @@ class ASHConsumer:
     def _validate_event(self, event: Dict[str, Any]) -> bool:
         for field in REQUIRED_FIELDS:
             if field not in event:
-                EVENTS_FAILED.labels(reason='missing_field').inc()
+                EVENTS_FAILED.labels(reason="missing_field").inc()
                 return False
         return True
 
@@ -358,23 +369,25 @@ class ASHConsumer:
         if len(self.seen_event_ids) > self.max_seen_ids:
             # Evict oldest half
             ids_list = list(self.seen_event_ids)
-            self.seen_event_ids = set(ids_list[self.max_seen_ids // 2:])
+            self.seen_event_ids = set(ids_list[self.max_seen_ids // 2 :])
         return False
 
     def process_message(self, log_data: Dict[str, Any]):
         """Process a single incoming event with validation and deduplication."""
         try:
             if not self._validate_event(log_data):
-                self.logger.warning(f"Invalid event schema: {log_data.get('event_id', 'unknown')}")
+                self.logger.warning(
+                    f"Invalid event schema: {log_data.get('event_id', 'unknown')}"
+                )
                 return
 
-            event_id = log_data.get('event_id', '')
+            event_id = log_data.get("event_id", "")
             if self._deduplicate(event_id):
                 self.logger.debug(f"Duplicate event skipped: {event_id}")
                 return
 
-            source = log_data.get('source', 'unknown')
-            event_type = log_data.get('event_type', 'unknown')
+            source = log_data.get("source", "unknown")
+            event_type = log_data.get("event_type", "unknown")
             EVENTS_RECEIVED.labels(source=source, event_type=event_type).inc()
 
             # Alerting
@@ -391,7 +404,7 @@ class ASHConsumer:
 
         except Exception as e:
             self.logger.error(f"Error processing message: {e}", exc_info=True)
-            EVENTS_FAILED.labels(reason='processing_error').inc()
+            EVENTS_FAILED.labels(reason="processing_error").inc()
 
     def _flush_batch(self):
         """Flush the current batch to storage."""
@@ -419,7 +432,7 @@ class ASHConsumer:
             # Re-add failed batch for retry
             self.batch_buffer = batch + self.batch_buffer
             BATCH_SIZE_GAUGE.set(len(self.batch_buffer))
-            EVENTS_FAILED.labels(reason='flush_error').inc()
+            EVENTS_FAILED.labels(reason="flush_error").inc()
 
         BATCH_FLUSH_LATENCY.observe(time.time() - start_time)
 
@@ -427,16 +440,16 @@ class ASHConsumer:
         """Write batch of events to JSONL files grouped by hostname."""
         files: Dict[str, list] = {}
         for event in events:
-            hostname = event.get('hostname', 'unknown')
+            hostname = event.get("hostname", "unknown")
             if hostname not in files:
                 files[hostname] = []
             files[hostname].append(event)
 
         for hostname, host_events in files.items():
             log_file = self.log_dir / f"ash-history-{hostname}.jsonl"
-            with open(log_file, 'a', encoding='utf-8') as f:
+            with open(log_file, "a", encoding="utf-8") as f:
                 for event in host_events:
-                    f.write(json.dumps(event, default=str) + '\n')
+                    f.write(json.dumps(event, default=str) + "\n")
 
     def _write_database_batch(self, events: List[Dict]):
         """Write batch to PostgreSQL with retry logic."""
@@ -450,11 +463,11 @@ class ASHConsumer:
                     session_events = []
 
                     for e in events:
-                        event_type = e.get('event_type', '')
+                        event_type = e.get("event_type", "")
 
-                        if event_type in ('session_start', 'session_end'):
+                        if event_type in ("session_start", "session_end"):
                             session_events.append(e)
-                        elif event_type.startswith('file_'):
+                        elif event_type.startswith("file_"):
                             file_events.append(e)
 
                         # All events go to command_logs
@@ -464,32 +477,32 @@ class ASHConsumer:
                     if command_events:
                         values = [
                             (
-                                e.get('event_id'),
-                                e.get('schema_version', '1.0'),
-                                e.get('hostname', 'unknown'),
-                                e.get('source', 'unknown'),
-                                e.get('event_type', 'unknown'),
-                                e.get('user', e.get('username', '')),
-                                e.get('uid'),
-                                e.get('session_id'),
-                                e.get('pid'),
-                                e.get('ppid'),
-                                e.get('tty'),
-                                e.get('command', ''),
-                                e.get('cwd'),
-                                e.get('exit_code'),
-                                e.get('duration_ms'),
-                                e.get('stdout', e.get('output', '')),
-                                e.get('file_path'),
-                                e.get('diff_content'),
-                                e.get('ssh_connection'),
-                                e.get('container_id'),
-                                e.get('container_name'),
-                                e.get('risk_score', 0),
-                                e.get('prev_hash'),
-                                e.get('event_hash'),
+                                e.get("event_id"),
+                                e.get("schema_version", "1.0"),
+                                e.get("hostname", "unknown"),
+                                e.get("source", "unknown"),
+                                e.get("event_type", "unknown"),
+                                e.get("user", e.get("username", "")),
+                                e.get("uid"),
+                                e.get("session_id"),
+                                e.get("pid"),
+                                e.get("ppid"),
+                                e.get("tty"),
+                                e.get("command", ""),
+                                e.get("cwd"),
+                                e.get("exit_code"),
+                                e.get("duration_ms"),
+                                e.get("stdout", e.get("output", "")),
+                                e.get("file_path"),
+                                e.get("diff_content"),
+                                e.get("ssh_connection"),
+                                e.get("container_id"),
+                                e.get("container_name"),
+                                e.get("risk_score", 0),
+                                e.get("prev_hash"),
+                                e.get("event_hash"),
                                 json.dumps(e, default=str),
-                                e.get('timestamp'),
+                                e.get("timestamp"),
                             )
                             for e in command_events
                         ]
@@ -506,36 +519,42 @@ class ASHConsumer:
                             values,
                             template="""(%s, %s, %s, %s, %s, %s, %s, %s::uuid, %s, %s,
                                          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                         %s, %s, %s, %s::jsonb, %s::timestamp)"""
+                                         %s, %s, %s, %s::jsonb, %s::timestamp)""",
                         )
 
                     # Handle sessions
                     for se in session_events:
-                        if se.get('event_type') == 'session_start':
-                            cursor.execute("""
+                        if se.get("event_type") == "session_start":
+                            cursor.execute(
+                                """
                                 INSERT INTO sessions
                                 (session_id, hostname, username, start_time, ssh_connection, tty, shell)
                                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                                 ON CONFLICT (session_id) DO NOTHING
-                            """, (
-                                se.get('session_id'),
-                                se.get('hostname'),
-                                se.get('user', se.get('username')),
-                                se.get('timestamp'),
-                                se.get('ssh_connection'),
-                                se.get('tty'),
-                                se.get('shell'),
-                            ))
-                        elif se.get('event_type') == 'session_end':
-                            cursor.execute("""
+                            """,
+                                (
+                                    se.get("session_id"),
+                                    se.get("hostname"),
+                                    se.get("user", se.get("username")),
+                                    se.get("timestamp"),
+                                    se.get("ssh_connection"),
+                                    se.get("tty"),
+                                    se.get("shell"),
+                                ),
+                            )
+                        elif se.get("event_type") == "session_end":
+                            cursor.execute(
+                                """
                                 UPDATE sessions
                                 SET end_time = %s, event_count = %s
                                 WHERE session_id = %s
-                            """, (
-                                se.get('timestamp'),
-                                se.get('events_in_session', 0),
-                                se.get('session_id'),
-                            ))
+                            """,
+                                (
+                                    se.get("timestamp"),
+                                    se.get("events_in_session", 0),
+                                    se.get("session_id"),
+                                ),
+                            )
 
                 self.db_conn.commit()
                 DB_WRITE_LATENCY.observe(time.time() - start_time)
@@ -543,9 +562,9 @@ class ASHConsumer:
 
             except psycopg2.OperationalError as e:
                 self.logger.warning(f"DB connection lost (attempt {attempt+1}): {e}")
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
                 try:
-                    self.db_conn = psycopg2.connect(self.config['database_url'])
+                    self.db_conn = psycopg2.connect(self.config["database_url"])
                     self.db_conn.autocommit = False
                 except Exception:
                     pass
@@ -553,16 +572,20 @@ class ASHConsumer:
                 self.logger.error(f"Database write error: {e}", exc_info=True)
                 if self.db_conn:
                     self.db_conn.rollback()
-                EVENTS_FAILED.labels(reason='db_write_error').inc()
+                EVENTS_FAILED.labels(reason="db_write_error").inc()
                 return
 
     def _start_flush_timer(self):
         """Periodic flush timer for batch timeout."""
+
         def flush_loop():
             while self.running:
                 time.sleep(1.0)
                 with self.batch_lock:
-                    if self.batch_buffer and (time.time() - self.last_flush) >= self.batch_timeout:
+                    if (
+                        self.batch_buffer
+                        and (time.time() - self.last_flush) >= self.batch_timeout
+                    ):
                         self._flush_batch()
 
         thread = threading.Thread(target=flush_loop, daemon=True)
@@ -570,6 +593,7 @@ class ASHConsumer:
 
     def _start_retention_timer(self):
         """Run retention maintenance daily."""
+
         def retention_loop():
             while self.running:
                 time.sleep(86400)  # 24 hours
@@ -594,24 +618,31 @@ class ASHConsumer:
         with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(
                 "SELECT * FROM command_logs WHERE log_timestamp < %s ORDER BY log_timestamp LIMIT 10000",
-                (archive_cutoff,)
+                (archive_cutoff,),
             )
             rows = cursor.fetchall()
 
             if rows:
-                archive_file = self.archive_path / f"commands_{archive_cutoff.strftime('%Y%m%d')}.jsonl.gz"
-                with gzip.open(archive_file, 'at', encoding='utf-8') as f:
+                archive_file = (
+                    self.archive_path
+                    / f"commands_{archive_cutoff.strftime('%Y%m%d')}.jsonl.gz"
+                )
+                with gzip.open(archive_file, "at", encoding="utf-8") as f:
                     for row in rows:
-                        f.write(json.dumps(dict(row), default=str) + '\n')
+                        f.write(json.dumps(dict(row), default=str) + "\n")
 
                 self.logger.info(f"Archived {len(rows)} records to {archive_file}")
 
         # Delete records older than retention_days
         retention_cutoff = datetime.now() - timedelta(days=self.retention_days)
         with self.db_conn.cursor() as cursor:
-            cursor.execute("DELETE FROM command_logs WHERE log_timestamp < %s", (retention_cutoff,))
+            cursor.execute(
+                "DELETE FROM command_logs WHERE log_timestamp < %s", (retention_cutoff,)
+            )
             deleted = cursor.rowcount
-            cursor.execute("DELETE FROM file_changes WHERE timestamp < %s", (retention_cutoff,))
+            cursor.execute(
+                "DELETE FROM file_changes WHERE timestamp < %s", (retention_cutoff,)
+            )
             self.db_conn.commit()
 
             if deleted > 0:
@@ -621,7 +652,9 @@ class ASHConsumer:
 
     def run(self):
         """Main consumer loop."""
-        self.logger.info(f"ASH Consumer v2.2 started (topic: {self.config['kafka_topic']})")
+        self.logger.info(
+            f"ASH Consumer v2.2 started (topic: {self.config['kafka_topic']})"
+        )
 
         try:
             for message in self.consumer:
@@ -646,7 +679,7 @@ class ASHConsumer:
             if self.batch_buffer:
                 self._flush_batch()
 
-        if hasattr(self, 'consumer'):
+        if hasattr(self, "consumer"):
             self.consumer.close()
         if self.db_conn:
             self.db_conn.close()
