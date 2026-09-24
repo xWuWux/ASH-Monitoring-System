@@ -83,6 +83,8 @@ services:
     environment:
       ASH_DATABASE_URL: postgresql://ash:${ASH_DB_PASSWORD:?Set ASH_DB_PASSWORD (see .env.example) — no default is provided}@postgres/ash_logs
       ASH_JWT_SECRET: ${ASH_JWT_SECRET:?Set ASH_JWT_SECRET (see .env.example) — the old default was a publicly-known literal that let anyone forge admin tokens}
+      ASH_ADMIN_USER: ${ASH_ADMIN_USER:?Set ASH_ADMIN_USER (see .env.example) — no default is provided}
+      ASH_ADMIN_PASS: ${ASH_ADMIN_PASS:?Set ASH_ADMIN_PASS (see .env.example) — the old default was the publicly-known literal "admin"}
       ASH_API_PORT: "8080"
     restart: unless-stopped
     healthcheck:
