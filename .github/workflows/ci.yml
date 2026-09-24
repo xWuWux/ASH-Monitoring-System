@@ -5,33 +5,137 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main]
+  workflow_dispatch: {}
 
 jobs:
-  lint:
+  # ── 1. Lint, Format & Secret Scan (fastest) ─────────────────────────────
+  lint-format-secrets:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ShellCheck
+      - name: Install ShellCheck and shfmt
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
+          curl -fsSL -o /usr/local/bin/shfmt \
+            "https://github.com/mvdan/sh/releases/download/v3.9.0/shfmt_v3.9.0_linux_amd64"
+          chmod +x /usr/local/bin/shfmt
 
-      - name: ShellCheck Bash scripts
+      - name: Install Python lint/format tools
+        run: pip install flake8 black detect-secrets
+
+      - name: ShellCheck
         run: |
           find src scripts -type f -name "*.sh" \
             ! -path "*/shells/zsh-integration.sh" \
             -print0 | xargs -0 -r shellcheck -S error
 
-      - name: Python lint
+      - name: shfmt (format check)
         run: |
-          pip install flake8 bandit
-          flake8 src/consumer/ --max-line-length=120 --ignore=E501,W503,E226
+          find src scripts -type f -name "*.sh" \
+            ! -path "*/shells/zsh-integration.sh" \
+            -print0 | xargs -0 shfmt -d -i 4 -ci
+
+      - name: flake8
+        run: |
+          # E203: black intentionally adds a space before ':' in slices
+          # (PEP8-compliant); flake8's default rule disagrees with black.
+          # This is black's own documented recommendation, not a local hack.
+          flake8 src/consumer/ --max-line-length=120 --ignore=E501,W503,E226,E203
+
+      - name: black (format check)
+        run: black --check src/consumer/
+
+      - name: detect-secrets (fail on newly introduced secrets only)
+        run: |
+          # --exclude-files must cover the baseline file itself: detect-secrets
+          # scans it like any other file, and its own hashed_secret hex values
+          # look like high-entropy strings to the Hex/Keyword plugins. Without
+          # this exclusion, the baseline is "new findings" on every single
+          # run even with zero real changes, permanently defeating the gate.
+          #
+          # The scan also rewrites the baseline's generated_at timestamp on
+          # every run regardless of findings, so a raw `git diff` on the
+          # file always shows a change. Compare everything except that field.
+          cp .secrets.baseline /tmp/baseline_before.json
+          detect-secrets scan --baseline .secrets.baseline \
+            --exclude-files '(\.git/|\.secrets\.baseline$)' \
+            --force-use-all-plugins
+          python3 -c "
+          import json, sys
+          before = json.load(open('/tmp/baseline_before.json'))
+          after = json.load(open('.secrets.baseline'))
+          before.pop('generated_at', None)
+          after.pop('generated_at', None)
+          if before != after:
+              print('New potential secrets detected (or an existing finding moved lines).')
+              print('If this is a real secret, remove it. If it is a false positive or')
+              print('just an existing finding shifting to a new line number, regenerate')
+              print('and commit .secrets.baseline locally.')
+              sys.exit(1)
+          print('No new secrets detected.')
+          "
+
+  # ── 2. Build Test (does it compile?) ────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: |
+          status=0
+          while IFS= read -r -d '' f; do
+            bash -n "$f" || status=1
+          done < <(find src scripts -type f -name "*.sh" \
+            ! -path "*/shells/zsh-integration.sh" -print0)
+          exit $status
+
+      - name: Python syntax check
+        run: python3 -m py_compile src/consumer/*.py
+
+  # ── 3. Security & Compliance (SAST + SCA + license check) ───────────────
+  security-compliance:
+    runs-on: ubuntu-latest
+    needs: [lint-format-secrets, build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bandit (SAST)
+        run: |
+          pip install bandit
           bandit -r src/consumer/ -ll -q
 
-  unit-tests:
+      - name: Semgrep (SAST)
+        run: |
+          pip install semgrep
+          semgrep --config p/security-audit --config p/secrets src/ --error
+
+      - name: pip-audit (dependency SCA)
+        run: |
+          pip install pip-audit
+          pip-audit -r src/consumer/requirements.txt
+
+      - name: License check
+        run: |
+          python -m venv /tmp/license-check-venv
+          /tmp/license-check-venv/bin/pip install --quiet -r src/consumer/requirements.txt pip-licenses
+          # Fails only on strong copyleft (GPL/AGPL). LGPL (psycopg2-binary)
+          # and permissive/weak-copyleft licenses are allowed -- LGPL permits
+          # dynamic linking/use without requiring this project's own code to
+          # be LGPL, unlike GPL/AGPL.
+          /tmp/license-check-venv/bin/pip-licenses \
+            --fail-on="GPL;AGPL" \
+            --ignore-packages pip-licenses prettytable wcwidth
+
+  # ── 4. Unit & Shell Tests (blocking, with coverage measurement) ─────────
+  unit-shell-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -43,52 +147,60 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq inotify-tools uuid-runtime
-          pip3 install kafka-python psycopg2-binary prometheus-client pytest flask pyjwt requests
+          sudo apt-get install -y -qq jq inotify-tools uuid-runtime kcov
+          pip install -r src/consumer/requirements.txt pytest pytest-cov
 
-      - name: Run BATS unit tests
+      - name: Run BATS unit tests (blocking)
         run: |
-          set -e
           for test_file in tests/unit/*.bats; do
-            echo "===== Running ${test_file} ====="
-            timeout 90s bats --verbose-run "${test_file}" || {
-              rc=$?
-              echo "::warning::${test_file} failed or timed out with exit code ${rc}; non-blocking during ASH 1.5 migration"
-            }
+            echo "===== ${test_file} ====="
+            timeout 90s bats --verbose-run "$test_file"
           done
 
-      - name: Run Python unit tests
-        run: pytest tests/unit/python/ -v 2>/dev/null || echo "No Python unit tests yet"
-
-  regression-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install BATS
+      - name: Run BATS regression tests (blocking)
         run: |
-          git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats
-          sudo /tmp/bats/install.sh /usr/local
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq inotify-tools uuid-runtime
-
-      - name: Run regression tests
-        run: |
-          set -e
           for test_file in tests/regression/*.bats; do
-            echo "===== Running ${test_file} ====="
-            timeout 90s bats --verbose-run "${test_file}" || {
-              rc=$?
-              echo "::warning::${test_file} failed or timed out with exit code ${rc}; non-blocking during ASH 1.5 migration"
-            }
+            echo "===== ${test_file} ====="
+            timeout 90s bats --verbose-run "$test_file"
           done
 
-  integration-tests:
+      - name: Shell coverage (report only, no threshold yet)
+        continue-on-error: true
+        run: |
+          mkdir -p coverage
+          for test_file in tests/unit/*.bats tests/regression/*.bats; do
+            name=$(basename "$test_file")
+            kcov --include-path="${GITHUB_WORKSPACE}/src/agent" \
+              "coverage/${name}" bats "$test_file" || true
+          done
+          kcov --merge coverage/merged coverage/*.bats
+          if [ -f coverage/merged/coverage.json ]; then
+            pct=$(python3 -c "import json; print(json.load(open('coverage/merged/coverage.json'))['percent_covered'])")
+            echo "Shell coverage: ${pct}%" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Could not locate kcov's merged coverage.json -- see uploaded artifact" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-coverage-report
+          path: coverage/
+          if-no-files-found: ignore
+
+      - name: Run Python unit tests (with coverage, once tests exist)
+        run: |
+          if find tests/unit/python -name 'test_*.py' 2>/dev/null | grep -q .; then
+            pytest tests/unit/python/ -v --cov=src/consumer --cov-report=term --cov-report=xml
+          else
+            echo "No Python unit tests yet (tests/unit/python/) -- add tests before this can gate on coverage"
+          fi
+
+  # ── 5. Integration Tests & Migration Checks ──────────────────────────────
+  integration-migration:
     runs-on: ubuntu-latest
+    needs: [unit-shell-tests, security-compliance]
     services:
       postgres:
         image: postgres:16
@@ -105,40 +217,74 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Install dependencies
+        run: pip install -r src/consumer/requirements.txt
+
+      - name: Schema creation + migration idempotency check
+        working-directory: src/consumer
         run: |
-          pip3 install kafka-python psycopg2-binary prometheus-client pytest flask pyjwt requests
+          python3 <<'PYEOF'
+          import importlib
+          import logging
+          import sys
+          import uuid
 
-      - name: Run integration tests
-        env:
-          ASH_DATABASE_URL: postgresql://ash:test_password@localhost:5432/ash_logs
-        run: |
-          python3 -c "
-          import psycopg2
-          conn = psycopg2.connect('postgresql://ash:test_password@localhost:5432/ash_logs')
-          print('Database connection OK')
-          conn.close()
-          "
+          sys.path.insert(0, ".")
+          ASHConsumer = importlib.import_module("ash-consumer").ASHConsumer
 
-  security-scan:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+          # Bypass __init__ (which unconditionally sets up a Kafka consumer
+          # too -- not needed here): construct just enough state to exercise
+          # _setup_database()/_create_tables() against a real Postgres.
+          consumer = object.__new__(ASHConsumer)
+          consumer.config = {
+              "database_url": "postgresql://ash:test_password@localhost:5432/ash_logs"
+          }
+          consumer.logger = logging.getLogger("integration-test")
 
-      - name: Check for hardcoded secrets
-        run: |
-          pip install detect-secrets
-          detect-secrets scan --all-files --force-use-all-plugins 2>/dev/null || true
+          consumer._setup_database()
+          assert consumer.db_conn is not None, "database setup failed"
 
-      - name: Bandit security scan
-        run: |
-          pip install bandit
-          bandit -r src/consumer/ -ll
+          expected_tables = {"command_logs", "file_changes", "sessions", "alerts"}
+          with consumer.db_conn.cursor() as cur:
+              cur.execute(
+                  "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+              )
+              tables = {row[0] for row in cur.fetchall()}
+          missing = expected_tables - tables
+          assert not missing, f"missing tables after schema creation: {missing}"
+          print(f"Schema creation OK: {sorted(expected_tables)}")
 
+          # Migration check: insert real data, re-run schema creation (the
+          # only "migration" mechanism this project has -- CREATE TABLE IF
+          # NOT EXISTS at startup, see docs/REMAINING_GAPS.md), then confirm
+          # the data survived.
+          session_id = str(uuid.uuid4())
+          with consumer.db_conn.cursor() as cur:
+              cur.execute(
+                  "INSERT INTO sessions (session_id, hostname) VALUES (%s, %s)",
+                  (session_id, "ci-integration-test"),
+              )
+              consumer.db_conn.commit()
+
+          consumer._create_tables()  # re-run "migration"
+
+          with consumer.db_conn.cursor() as cur:
+              cur.execute(
+                  "SELECT count(*) FROM sessions WHERE session_id = %s", (session_id,)
+              )
+              count = cur.fetchone()[0]
+          assert count == 1, "data lost after re-running schema migration"
+          print("Migration idempotency check OK: data survived a second schema run")
+          PYEOF
+
+  # ── Build installable package (existing artifact build) ─────────────────
   build-package:
     runs-on: ubuntu-latest
-    needs: [lint, unit-tests]
+    needs: [integration-migration]
     steps:
       - uses: actions/checkout@v4
 
@@ -154,3 +300,72 @@ jobs:
         with:
           name: ash-monitor-package
           path: ash-monitor-*.tar.gz
+
+  # ── Capstone: everything required for merge passed ──────────────────────
+  ci-success:
+    runs-on: ubuntu-latest
+    needs:
+      [
+        lint-format-secrets,
+        build,
+        security-compliance,
+        unit-shell-tests,
+        integration-migration,
+        build-package,
+      ]
+    steps:
+      - run: echo "Ready for code review and merge."
+
+  # ── 6. Ephemeral Deploy & Performance Benchmarks (optional/contextual) ──
+  # Not part of the required-to-merge chain above: spins up the full
+  # docker-compose stack, which is slow and heavier than a PR should have to
+  # wait on for every push. Runs on push to main, or on demand.
+  ephemeral-deploy-benchmarks:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: [build-package]
+    timeout-minutes: 15
+    env:
+      ASH_DB_PASSWORD: ci-ephemeral-test-password
+      ASH_JWT_SECRET: ci-ephemeral-test-jwt-secret-not-for-real-use
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the stack
+        working-directory: deployments/docker
+        run: docker compose up -d --build
+
+      - name: Wait for services to become healthy
+        run: |
+          for i in $(seq 1 30); do
+            unhealthy=$(docker ps --filter "health=unhealthy" -q)
+            starting=$(docker ps --filter "health=starting" -q)
+            if [ -z "$unhealthy" ] && [ -z "$starting" ]; then
+              echo "All containers healthy (or have no healthcheck)."
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "Timed out waiting for containers to become healthy."
+              docker ps
+              docker compose -f deployments/docker/docker-compose.yml logs
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Smoke test the API
+        run: curl -fsS http://localhost:8080/health
+
+      - name: Run performance benchmark
+        run: bash tests/performance/benchmark.sh 1000 | tee benchmark-results.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-benchmark-results
+          path: benchmark-results.txt
+
+      - name: Tear down the stack
+        if: always()
+        working-directory: deployments/docker
+        run: docker compose down -v
