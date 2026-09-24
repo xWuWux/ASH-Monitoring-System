@@ -92,6 +92,20 @@ VALID_EVENT_TYPES = [
 ]
 
 
+def _connect_db(database_url: str):
+    # connect_timeout bounds the initial TCP/auth handshake; statement_timeout
+    # (a libpq connection option, applied server-side for every query on this
+    # connection) bounds how long any single query can run once connected.
+    # Without both, an unresponsive Postgres (network partition, overload, a
+    # runaway query) can make a query block indefinitely -- which matters
+    # here specifically because _write_database_batch() runs while
+    # batch_lock is held (see _flush_batch()), so a hung query would freeze
+    # the entire consumer, not just one write.
+    return psycopg2.connect(
+        database_url, connect_timeout=10, options="-c statement_timeout=30000"
+    )
+
+
 class ASHConsumer:
     """Production-grade ASH event consumer with resilience patterns."""
 
@@ -200,7 +214,7 @@ class ASHConsumer:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                self.db_conn = psycopg2.connect(self.config["database_url"])
+                self.db_conn = _connect_db(self.config["database_url"])
                 self.db_conn.autocommit = False
                 self._create_tables()
                 self.logger.info("Database connection established")
@@ -398,28 +412,45 @@ class ASHConsumer:
             if self.alert_engine:
                 self.alert_engine.check_event(log_data)
 
-            # Add to batch buffer
+            # Add to batch buffer. _flush_batch() manages batch_lock itself
+            # and does the actual (potentially slow) file/DB writes outside
+            # the lock -- it must not be called from within another
+            # `with self.batch_lock:` block, or the lock it takes internally
+            # would block forever waiting for a lock this same thread is
+            # still holding.
             with self.batch_lock:
                 self.batch_buffer.append(log_data)
                 BATCH_SIZE_GAUGE.set(len(self.batch_buffer))
+                should_flush = len(self.batch_buffer) >= self.batch_size
 
-                if len(self.batch_buffer) >= self.batch_size:
-                    self._flush_batch()
+            if should_flush:
+                self._flush_batch()
 
         except Exception as e:
             self.logger.error(f"Error processing message: {e}", exc_info=True)
             EVENTS_FAILED.labels(reason="processing_error").inc()
 
     def _flush_batch(self):
-        """Flush the current batch to storage."""
-        if not self.batch_buffer:
-            return
+        """Flush the current batch to storage.
+
+        Takes batch_lock only to snapshot-and-clear the buffer (and, on
+        failure, to put it back) -- never while writing to disk or the
+        database. _write_database_batch() can block for a while even with
+        _connect_db()'s timeouts (up to connect_timeout to reconnect, plus
+        statement_timeout per retry, times its own retry loop); holding
+        batch_lock for that whole duration would block process_message()
+        for every other incoming Kafka message, and the periodic flush_loop
+        timer thread, until it finished -- effectively freezing the whole
+        consumer any time a write is slow, not just this one flush.
+        """
+        with self.batch_lock:
+            if not self.batch_buffer:
+                return
+            batch = self.batch_buffer[:]
+            self.batch_buffer = []
+            BATCH_SIZE_GAUGE.set(0)
 
         start_time = time.time()
-        batch = self.batch_buffer[:]
-        self.batch_buffer = []
-        BATCH_SIZE_GAUGE.set(0)
-
         try:
             # Write to file
             self._write_file_batch(batch)
@@ -434,8 +465,9 @@ class ASHConsumer:
         except Exception as e:
             self.logger.error(f"Batch flush failed: {e}")
             # Re-add failed batch for retry
-            self.batch_buffer = batch + self.batch_buffer
-            BATCH_SIZE_GAUGE.set(len(self.batch_buffer))
+            with self.batch_lock:
+                self.batch_buffer = batch + self.batch_buffer
+                BATCH_SIZE_GAUGE.set(len(self.batch_buffer))
             EVENTS_FAILED.labels(reason="flush_error").inc()
 
         BATCH_FLUSH_LATENCY.observe(time.time() - start_time)
@@ -568,7 +600,7 @@ class ASHConsumer:
                 self.logger.warning(f"DB connection lost (attempt {attempt+1}): {e}")
                 time.sleep(2**attempt)
                 try:
-                    self.db_conn = psycopg2.connect(self.config["database_url"])
+                    self.db_conn = _connect_db(self.config["database_url"])
                     self.db_conn.autocommit = False
                 except Exception:
                     pass
@@ -585,12 +617,16 @@ class ASHConsumer:
         def flush_loop():
             while self.running:
                 time.sleep(1.0)
+                # Same reasoning as process_message(): decide whether to
+                # flush under the lock, but call _flush_batch() (which
+                # takes the lock itself) after releasing it.
                 with self.batch_lock:
-                    if (
+                    should_flush = (
                         self.batch_buffer
                         and (time.time() - self.last_flush) >= self.batch_timeout
-                    ):
-                        self._flush_batch()
+                    )
+                if should_flush:
+                    self._flush_batch()
 
         thread = threading.Thread(target=flush_loop, daemon=True)
         thread.start()
@@ -678,10 +714,9 @@ class ASHConsumer:
         self.running = False
 
     def _cleanup(self):
-        # Flush remaining batch
-        with self.batch_lock:
-            if self.batch_buffer:
-                self._flush_batch()
+        # _flush_batch() takes batch_lock itself and no-ops on an empty
+        # buffer, so it's always safe to call directly here.
+        self._flush_batch()
 
         if hasattr(self, "consumer"):
             self.consumer.close()

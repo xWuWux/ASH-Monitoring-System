@@ -217,25 +217,63 @@ load_redaction_rules() {
             REDACTION_REPLACEMENTS+=("$replacement")
         done <"${ASH_REDACTION_CONFIG}"
     fi
+
+    _validate_redaction_patterns
+}
+
+# redact_sensitive_data() applies every pattern in a single sed invocation
+# (see below) instead of one sed process per pattern, for throughput -- but
+# that means a single malformed regex (most likely from a hand-edited
+# redaction_rules.conf, not the built-ins above) would now fail the *whole*
+# sed command and skip every pattern's redaction, not just the broken one.
+# Validate once here, at load time, and drop anything that doesn't compile,
+# so the fast path in redact_sensitive_data can assume every pattern in
+# REDACTION_PATTERNS is safe to run together.
+_validate_redaction_patterns() {
+    local -a valid_patterns=() valid_replacements=()
+    local i pat
+
+    for i in "${!REDACTION_PATTERNS[@]}"; do
+        pat="${REDACTION_PATTERNS[$i]//\//\\/}"
+        if printf '' | sed -E "s/${pat}/x/" >/dev/null 2>&1; then
+            valid_patterns+=("${REDACTION_PATTERNS[$i]}")
+            valid_replacements+=("${REDACTION_REPLACEMENTS[$i]}")
+        else
+            agent_log "WARN" "Dropping invalid redaction pattern: ${REDACTION_PATTERNS[$i]}"
+        fi
+    done
+
+    REDACTION_PATTERNS=("${valid_patterns[@]}")
+    REDACTION_REPLACEMENTS=("${valid_replacements[@]}")
 }
 
 redact_sensitive_data() {
     local input="$1"
-    local output="${input}"
+    local -a sed_args=()
+    local i pat rep
 
     for i in "${!REDACTION_PATTERNS[@]}"; do
         # sed's `s/pattern/replacement/` uses '/' as the delimiter. Patterns
         # matching URLs (e.g. `scheme://user:pass@host`) contain literal '/'
         # characters that would otherwise be misread as extra delimiters,
-        # silently corrupting the substitution (and — via the `|| echo
-        # "$output"` fallback below — silently skipping redaction entirely
-        # instead of failing loudly). Escape '/' in both pattern and
-        # replacement before building the sed command.
-        local pat="${REDACTION_PATTERNS[$i]//\//\\/}"
-        local rep="${REDACTION_REPLACEMENTS[$i]//\//\\/}"
-        output=$(echo "$output" | sed -E "s/${pat}/${rep}/gI" 2>/dev/null || echo "$output")
+        # silently corrupting the substitution. Escape '/' in both pattern
+        # and replacement before building the sed command.
+        pat="${REDACTION_PATTERNS[$i]//\//\\/}"
+        rep="${REDACTION_REPLACEMENTS[$i]//\//\\/}"
+        sed_args+=(-e "s/${pat}/${rep}/gI")
     done
-    echo "$output"
+
+    if [[ ${#sed_args[@]} -eq 0 ]]; then
+        echo "$input"
+        return
+    fi
+
+    # One sed process applying every -e expression in sequence (each
+    # operating on the previous one's output, same net effect as the old
+    # per-pattern loop) instead of one sed process per pattern -- this was
+    # the dominant cost in tests/performance/benchmark.sh's ~89ms/event
+    # reading, going from ~11 forks to 1 for a typical rule set.
+    echo "$input" | sed -E "${sed_args[@]}" 2>/dev/null || echo "$input"
 }
 
 # ─── Hash-Chained Append-Only Logs ─────────────────────────────��────────────
@@ -254,10 +292,20 @@ hash_chain_init() {
 hash_chain_append() {
     local event_json="$1"
     local prev_hash
+    # Re-read the file on every call rather than caching the last hash in a
+    # variable: this file is shared across every concurrent session on the
+    # host (ASH_HASH_FILE is per-host, not per-process), so the only correct
+    # "previous hash" is whatever is actually on disk right now. Caching it
+    # in memory would silently break chain integrity the moment a second
+    # terminal session appends an event first.
     prev_hash=$(tail -1 "${ASH_HASH_FILE}" 2>/dev/null || echo "0000000000000000000000000000000000000000000000000000000000000000")
     local combined="${prev_hash}${event_json}"
     local current_hash
-    current_hash=$(printf '%s' "$combined" | sha256sum | cut -d' ' -f1)
+    # sha256sum's own output ("<hash>  -") already has the hash first;
+    # trimming it with a parameter expansion instead of piping through an
+    # extra `cut` process saves one fork per event.
+    current_hash=$(printf '%s' "$combined" | sha256sum)
+    current_hash="${current_hash%% *}"
 
     # Add hash fields to event JSON
     local signed_event

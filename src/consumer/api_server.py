@@ -4,14 +4,17 @@ ASH REST API Server — Search, analytics, and real-time streaming.
 Provides JWT-based authentication and RBAC.
 """
 
+import hmac
 import os
 from datetime import datetime, timedelta
 from functools import wraps
 
 import jwt
 import psycopg2
-from psycopg2.extras import RealDictCursor
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from psycopg2.extras import RealDictCursor
 
 
 def _require_env(name: str) -> str:
@@ -33,6 +36,14 @@ app.config["JWT_SECRET"] = _require_env("ASH_JWT_SECRET")
 app.config["JWT_EXPIRY_HOURS"] = int(os.environ.get("ASH_JWT_EXPIRY_HOURS", "24"))
 DATABASE_URL = _require_env("ASH_DATABASE_URL")
 
+# In-memory storage: correct for a single process, but under gunicorn's
+# multiple sync workers (see Dockerfile.api's --workers 4) each worker
+# tracks its own count, so the effective limit is roughly workers x the
+# configured rate, not an exact bound. A precise limit across all workers
+# needs a shared backend (e.g. Redis), which isn't part of this stack today
+# -- this is still a large improvement over no rate limiting at all.
+limiter = Limiter(app=app, key_func=get_remote_address)
+
 # ─── RBAC ─────────────────────────────────────────────────────────────────────
 ROLE_PERMISSIONS = {
     "admin": ["read", "write", "delete", "manage_users", "verify_integrity", "export"],
@@ -40,9 +51,36 @@ ROLE_PERMISSIONS = {
     "readonly": ["read", "search"],
 }
 
+# Real credentials per role, from the environment only -- there is no user
+# store (see create_token()). ASH_ADMIN_USER/ASH_ADMIN_PASS are required:
+# refusing to start with an insecure "admin"/"admin" default, the same
+# reasoning as ASH_JWT_SECRET/ASH_DATABASE_URL above. analyst/readonly
+# credentials are optional -- if not configured, that role simply cannot
+# log in, which is the safe failure mode (nobody gets a token for it),
+# unlike the previous behavior of handing a valid readonly token to any
+# request with a non-empty username and no real credential check at all.
+ROLE_CREDENTIALS = {
+    "admin": (_require_env("ASH_ADMIN_USER"), _require_env("ASH_ADMIN_PASS"))
+}
+if os.environ.get("ASH_ANALYST_USER") and os.environ.get("ASH_ANALYST_PASS"):
+    ROLE_CREDENTIALS["analyst"] = (
+        os.environ["ASH_ANALYST_USER"],
+        os.environ["ASH_ANALYST_PASS"],
+    )
+if os.environ.get("ASH_READONLY_USER") and os.environ.get("ASH_READONLY_PASS"):
+    ROLE_CREDENTIALS["readonly"] = (
+        os.environ["ASH_READONLY_USER"],
+        os.environ["ASH_READONLY_PASS"],
+    )
+
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+
+
+@app.errorhandler(429)
+def rate_limit_exceeded(_e):
+    return jsonify({"error": "Too many requests, try again later"}), 429
 
 
 def require_role(*roles):
@@ -73,24 +111,37 @@ def require_role(*roles):
 
 # ─── Auth Endpoints ──────────────────────────────────────────────────────────
 @app.route("/api/v1/auth/token", methods=["POST"])
+@limiter.limit("5 per minute")
 def create_token():
-    """Generate JWT token (basic auth or API key)."""
-    data = request.get_json()
+    """Generate a JWT for a role, if the request's credentials match that
+    role's configured username/password exactly. There is no user store
+    (see ROLE_CREDENTIALS above): every role that isn't configured simply
+    has no valid credentials, and every mismatch -- including a request
+    with no matching role at all -- is rejected the same way. Previously,
+    any request with a non-empty username that *didn't* match the admin
+    credentials was issued a valid "readonly" token anyway, with no
+    credential check for that role at all.
+    """
+    data = request.get_json(silent=True) or {}
     username = data.get("username", "")
     password = data.get("password", "")
-    role = data.get("role", "readonly")
 
-    # In production, validate against a user store
-    # For now, accept configured credentials from env
-    admin_user = os.environ.get("ASH_ADMIN_USER", "admin")
-    admin_pass = os.environ.get("ASH_ADMIN_PASS", "admin")
+    if not username or not password:
+        return jsonify({"error": "username and password required"}), 400
 
-    if username == admin_user and password == admin_pass:
-        role = "admin"
-    elif not username:
-        return jsonify({"error": "Username required"}), 400
-    else:
-        role = "readonly"
+    role = None
+    for candidate_role, (cred_user, cred_pass) in ROLE_CREDENTIALS.items():
+        # hmac.compare_digest: constant-time, so a wrong password can't be
+        # guessed character-by-character via response-time differences the
+        # way a plain `==` comparison could.
+        if hmac.compare_digest(username, cred_user) and hmac.compare_digest(
+            password, cred_pass
+        ):
+            role = candidate_role
+            break
+
+    if role is None:
+        return jsonify({"error": "Invalid credentials"}), 401
 
     payload = {
         "sub": username,
