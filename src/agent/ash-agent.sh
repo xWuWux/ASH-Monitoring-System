@@ -684,8 +684,50 @@ ASH_PENDING_SNAPSHOTS=()
 
 # ─── Main Command Logging ────��───────────────────────────────────────────────
 log_command() {
-    # Skip ASH's own internal commands
-    [[ "${BASH_COMMAND}" =~ ^(log_command|safe_log_write|emit_event|hash_chain|spool_|agent_log|rate_limit|redact_|check_pending|track_file) ]] && return 0
+    # Reentrancy guard. `set -T` (functrace) makes the DEBUG trap fire for
+    # *every* command anywhere, including every command this function
+    # itself runs -- date, jq, sed, tail, flock, sha256sum, ... via
+    # redact_sensitive_data/emit_event/hash_chain_append/track_file_changes
+    # below -- and extdebug is not enabled anywhere in this file, so a
+    # trap handler's return value never skips the command it fired for; it
+    # just means log_command runs again, for that command, before the real
+    # one proceeds. The previous guard only matched BASH_COMMAND against a
+    # prefix list of ASH's own function names, which caught direct calls to
+    # those functions but not one single external command any of them
+    # spawns -- so each one independently re-entered log_command, which
+    # runs ~15-20 more commands, each doing the same. Unbounded recursive
+    # self-triggering, not a fixed one-shot chain -- confirmed live: one
+    # `ls` hit 50+ nested re-entries before a hard safety cap in testing
+    # cut it off.
+    #
+    # Fix: disable the DEBUG trap for the duration of our own processing,
+    # then re-arm it once we're done, instead of trying to detect and
+    # skip our own commands after the fact. Nothing that runs while the
+    # trap is off -- no matter what it's named or how deeply nested --
+    # can re-enter this function, because there's no trap installed to
+    # invoke it. This is the standard fix for DEBUG-trap self-reentrancy
+    # (the same pattern bash-preexec and similar prompt-hook tools use).
+    # Confirmed live with instrumented counting: exactly one real
+    # processing pass per real top-level command, zero extra entries,
+    # where the flag-based approach this replaced still let a few
+    # reentrant calls through (a check-then-set is two separate traced
+    # statements, and a nested firing between them sees the flag still
+    # unset) -- disabling the trap outright has no such window.
+    #
+    # Re-arming happens *inside* this function, right before returning,
+    # rather than relying on a caller to do it: the trap must come back
+    # for the *next* command the user types, and this is the only place
+    # that reliably runs exactly once per real invocation.
+    trap - DEBUG
+
+    _log_command_body
+    local rc=$?
+
+    trap 'log_command' DEBUG
+    return $rc
+}
+
+_log_command_body() {
     [[ "${BASH_COMMAND}" == ":" ]] && return 0
 
     # Rate limiting
