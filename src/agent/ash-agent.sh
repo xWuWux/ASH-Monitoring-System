@@ -15,8 +15,8 @@
 _ASH_CALLER_SHELL_OPTS=$(set +o)
 
 set -euo pipefail
-set -T  # functrace — inherit DEBUG/ERR traps into functions and subshells
-set -E  # errtrace — inherit ERR trap into functions and subshells
+set -T # functrace — inherit DEBUG/ERR traps into functions and subshells
+set -E # errtrace — inherit ERR trap into functions and subshells
 
 readonly ASH_VERSION="2.2.0"
 
@@ -96,7 +96,7 @@ agent_log() {
     else
         log_entry="{\"timestamp\":\"$timestamp\",\"level\":\"$level\",\"message\":\"$message\",\"pid\":$$}"
     fi
-    echo "$log_entry" >> "${ASH_AGENT_LOG}" 2>/dev/null || true
+    echo "$log_entry" >>"${ASH_AGENT_LOG}" 2>/dev/null || true
 }
 
 # ─── Configuration Validation ────────────────────────────────────────────────
@@ -160,16 +160,16 @@ safe_log_write() {
     local target_file="${2:-${ASH_EVENTS_FILE}}"
     local temp_file="${ASH_TEMP_DIR}/write.$$.tmp"
 
-    printf '%s\n' "$content" > "$temp_file" 2>/dev/null || return 1
+    printf '%s\n' "$content" >"$temp_file" 2>/dev/null || return 1
 
     (
         flock -x 200
-        cat "$temp_file" >> "$target_file"
+        cat "$temp_file" >>"$target_file"
         rm -f "$temp_file"
     ) 200>"${target_file}.lock" 2>/dev/null
 
     if [[ $? -ne 0 ]]; then
-        printf '%s\n' "$content" >> "$target_file" 2>/dev/null || return 1
+        printf '%s\n' "$content" >>"$target_file" 2>/dev/null || return 1
         rm -f "$temp_file"
     fi
     return 0
@@ -215,7 +215,7 @@ load_redaction_rules() {
             [[ -z "$pattern" ]] && continue
             REDACTION_PATTERNS+=("$pattern")
             REDACTION_REPLACEMENTS+=("$replacement")
-        done < "${ASH_REDACTION_CONFIG}"
+        done <"${ASH_REDACTION_CONFIG}"
     fi
 }
 
@@ -241,7 +241,7 @@ redact_sensitive_data() {
 # ─── Hash-Chained Append-Only Logs ─────────────────────────────��────────────
 hash_chain_init() {
     if [[ ! -f "${ASH_HASH_FILE}" ]]; then
-        echo "0000000000000000000000000000000000000000000000000000000000000000" > "${ASH_HASH_FILE}"
+        echo "0000000000000000000000000000000000000000000000000000000000000000" >"${ASH_HASH_FILE}"
         # 600, not 400: hash_chain_append() must keep appending to this file
         # for the life of the process. 400 (no write bit, even for the
         # owner) blocks that on every non-root run and only ever "worked"
@@ -267,7 +267,7 @@ hash_chain_append() {
         signed_event="${event_json%\}},\"prev_hash\":\"${prev_hash}\",\"event_hash\":\"${current_hash}\"}"
     fi
 
-    echo "$current_hash" >> "${ASH_HASH_FILE}"
+    echo "$current_hash" >>"${ASH_HASH_FILE}"
     echo "$signed_event"
 }
 
@@ -311,7 +311,7 @@ verify_hash_chain() {
             ((errors++))
         fi
         prev_hash="$stored_hash"
-    done < "$log_file"
+    done <"$log_file"
 
     if [[ $errors -eq 0 ]]; then
         echo "PASS: All $line_num entries verified successfully"
@@ -330,13 +330,13 @@ spool_init() {
 spool_write() {
     local event_json="$1"
     local spool_file="${ASH_SPOOL_DIR}/pending/$(date +%s%N)_$$"
-    printf '%s\n' "$event_json" > "$spool_file" 2>/dev/null || return 1
+    printf '%s\n' "$event_json" >"$spool_file" 2>/dev/null || return 1
 
     # Enforce max spool size
     local spool_size
     spool_size=$(du -sb "${ASH_SPOOL_DIR}/pending" 2>/dev/null | cut -f1)
     if [[ ${spool_size:-0} -gt ${ASH_SPOOL_MAX_SIZE} ]]; then
-        ls -t "${ASH_SPOOL_DIR}/pending/" | tail -n +100 | \
+        ls -t "${ASH_SPOOL_DIR}/pending/" | tail -n +100 |
             xargs -I{} rm -f "${ASH_SPOOL_DIR}/pending/{}" 2>/dev/null || true
     fi
 }
@@ -369,7 +369,7 @@ spool_flush_timer() {
         sleep 30
         spool_flush 2>/dev/null || true
     done &
-    echo $! > "${ASH_TEMP_DIR}/spool_flush.pid"
+    echo $! >"${ASH_TEMP_DIR}/spool_flush.pid"
 }
 
 send_to_kafka_raw() {
@@ -494,7 +494,7 @@ emit_session_start() {
 }
 
 emit_session_end() {
-    local duration=$(( $(date +%s) - ${ASH_START_TIME} ))
+    local duration=$(($(date +%s) - ${ASH_START_TIME}))
     local extra
     if command -v jq >/dev/null 2>&1; then
         extra=$(jq -n -c \
@@ -717,22 +717,22 @@ start_file_watcher() {
     [[ -z "$watched_files_str" ]] && return 0
 
     inotifywait -m -e modify,create,delete,move,attrib ${watched_files_str} \
-        --format '%T|%e|%w%f' --timefmt '%Y-%m-%dT%H:%M:%SZ' 2>/dev/null | \
-    while IFS='|' read -r timestamp event file; do
-        local extra
-        if command -v jq >/dev/null 2>&1; then
-            extra=$(jq -n -c \
-                --arg fp "$file" \
-                --arg ev "$event" \
-                --arg src "inotify" \
-                '{file_path: $fp, inotify_event: $ev, source: $src}')
-        else
-            extra="{\"file_path\":\"$file\",\"inotify_event\":\"$event\",\"source\":\"inotify\"}"
-        fi
-        emit_event "file_${event,,}" "$extra"
-    done &
+        --format '%T|%e|%w%f' --timefmt '%Y-%m-%dT%H:%M:%SZ' 2>/dev/null |
+        while IFS='|' read -r timestamp event file; do
+            local extra
+            if command -v jq >/dev/null 2>&1; then
+                extra=$(jq -n -c \
+                    --arg fp "$file" \
+                    --arg ev "$event" \
+                    --arg src "inotify" \
+                    '{file_path: $fp, inotify_event: $ev, source: $src}')
+            else
+                extra="{\"file_path\":\"$file\",\"inotify_event\":\"$event\",\"source\":\"inotify\"}"
+            fi
+            emit_event "file_${event,,}" "$extra"
+        done &
 
-    echo $! > "${ASH_TEMP_DIR}/inotify.pid"
+    echo $! >"${ASH_TEMP_DIR}/inotify.pid"
     agent_log "INFO" "inotify watcher started (PID: $(cat "${ASH_TEMP_DIR}/inotify.pid"))"
 }
 
@@ -758,7 +758,7 @@ start_container_monitor() {
         emit_event "container_${action}" "$extra"
     done &
 
-    echo $! > "${ASH_TEMP_DIR}/docker_events.pid"
+    echo $! >"${ASH_TEMP_DIR}/docker_events.pid"
     agent_log "INFO" "Docker event monitor started"
 }
 
@@ -784,9 +784,9 @@ start_auditd_monitor() {
 
             local event_type="command_start"
             case "$key" in
-                ash_passwd|ash_shadow|ash_sshd|ash_root_ssh) event_type="file_modify" ;;
+                ash_passwd | ash_shadow | ash_sshd | ash_root_ssh) event_type="file_modify" ;;
                 ash_sudoers*) event_type="file_modify" ;;
-                ash_crontab|ash_cron_d|ash_systemd) event_type="file_modify" ;;
+                ash_crontab | ash_cron_d | ash_systemd) event_type="file_modify" ;;
             esac
 
             local extra
@@ -806,7 +806,7 @@ start_auditd_monitor() {
         fi
     done &
 
-    echo $! > "${ASH_TEMP_DIR}/auditd_tail.pid"
+    echo $! >"${ASH_TEMP_DIR}/auditd_tail.pid"
     agent_log "INFO" "auditd monitor started"
 }
 
@@ -824,7 +824,7 @@ save_state() {
     else
         state_json="{\"pid\":$$,\"ppid\":${PPID:-1},\"session_id\":\"${ASH_SESSION_ID}\",\"events_logged\":${EVENTS_LOGGED:-0}}"
     fi
-    echo "$state_json" > "${ASH_STATE_FILE}" 2>/dev/null || true
+    echo "$state_json" >"${ASH_STATE_FILE}" 2>/dev/null || true
 }
 
 recover_state() {
@@ -863,7 +863,7 @@ recover_state() {
 # ─── Prometheus Metrics ──────────────────────────────────────────────────────
 write_prometheus_metrics() {
     local metrics_file="${ASH_TEMP_DIR}/ash_metrics.prom"
-    cat > "$metrics_file" << EOF
+    cat >"$metrics_file" <<EOF
 # HELP ash_agent_events_total Total events logged by ASH agent
 # TYPE ash_agent_events_total counter
 ash_agent_events_total ${EVENTS_LOGGED:-0}

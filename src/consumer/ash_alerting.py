@@ -13,17 +13,23 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-logger = logging.getLogger('ash-alerting')
+logger = logging.getLogger("ash-alerting")
 
 
 class AlertRule:
     """A single alert rule with pattern matching and cooldown."""
 
-    def __init__(self, name: str, pattern: str, severity: str,
-                 description: str, actions: List[str],
-                 mitre_id: Optional[str] = None,
-                 mitre_tactic: Optional[str] = None,
-                 cooldown_seconds: int = 300):
+    def __init__(
+        self,
+        name: str,
+        pattern: str,
+        severity: str,
+        description: str,
+        actions: List[str],
+        mitre_id: Optional[str] = None,
+        mitre_tactic: Optional[str] = None,
+        cooldown_seconds: int = 300,
+    ):
         self.name = name
         self.pattern = re.compile(pattern, re.IGNORECASE)
         self.severity = severity
@@ -36,7 +42,7 @@ class AlertRule:
         self.trigger_count: int = 0
 
     def matches(self, event: Dict[str, Any]) -> bool:
-        command = event.get('command', '')
+        command = event.get("command", "")
         if not command:
             return False
 
@@ -60,7 +66,7 @@ class ASHAlertEngine:
         default_rules = [
             AlertRule(
                 name="Destructive File Operations",
-                pattern=r'rm\s+(-rf?|-fr?)\s+(/|/etc|/var|/home|/root|/usr)',
+                pattern=r"rm\s+(-rf?|-fr?)\s+(/|/etc|/var|/home|/root|/usr)",
                 severity="critical",
                 description="Potentially destructive rm command on critical directory",
                 actions=["webhook", "log"],
@@ -69,7 +75,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="Reverse Shell Detection",
-                pattern=r'(nc|ncat|netcat)\s.*(-l|-e|/dev/tcp|/dev/udp)|bash\s+-i\s+>&\s*/dev/tcp',
+                pattern=r"(nc|ncat|netcat)\s.*(-l|-e|/dev/tcp|/dev/udp)|bash\s+-i\s+>&\s*/dev/tcp",
                 severity="critical",
                 description="Possible reverse shell detected",
                 actions=["webhook", "log"],
@@ -78,7 +84,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="Download and Execute",
-                pattern=r'(wget|curl)\s+[^\|]*\|\s*(sh|bash|python|perl)',
+                pattern=r"(wget|curl)\s+[^\|]*\|\s*(sh|bash|python|perl)",
                 severity="critical",
                 description="Download and execute pattern — possible malware delivery",
                 actions=["webhook", "log"],
@@ -87,7 +93,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="Credential File Access",
-                pattern=r'(cat|less|more|head|tail|strings|xxd)\s+(/etc/shadow|/etc/passwd|.*\.pem|.*id_rsa)',
+                pattern=r"(cat|less|more|head|tail|strings|xxd)\s+(/etc/shadow|/etc/passwd|.*\.pem|.*id_rsa)",
                 severity="high",
                 description="Reading sensitive credential or key files",
                 actions=["webhook", "log"],
@@ -96,7 +102,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="Dangerous Permission Change",
-                pattern=r'chmod\s+(777|666|000|[+]s|u\+s|4[0-9]{3})',
+                pattern=r"chmod\s+(777|666|000|[+]s|u\+s|4[0-9]{3})",
                 severity="high",
                 description="Dangerous permission modification (world-writable or SUID)",
                 actions=["webhook", "log"],
@@ -105,7 +111,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="Privilege Escalation to Root",
-                pattern=r'sudo\s+(su|bash|sh|zsh|fish)\s*$|sudo\s+su\s*-',
+                pattern=r"sudo\s+(su|bash|sh|zsh|fish)\s*$|sudo\s+su\s*-",
                 severity="high",
                 description="Privilege escalation to root shell",
                 actions=["webhook", "log"],
@@ -114,7 +120,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="SSH Key Manipulation",
-                pattern=r'(cat|echo|tee|cp|mv|>>)\s.*authorized_keys',
+                pattern=r"(cat|echo|tee|cp|mv|>>)\s.*authorized_keys",
                 severity="high",
                 description="SSH authorized_keys modification — possible persistence",
                 actions=["webhook", "log"],
@@ -123,7 +129,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="Cron Persistence",
-                pattern=r'(crontab\s+-[elr]|echo\s.*>>\s*/etc/cron|/etc/cron\.d/)',
+                pattern=r"(crontab\s+-[elr]|echo\s.*>>\s*/etc/cron|/etc/cron\.d/)",
                 severity="medium",
                 description="Cron schedule modification — possible persistence",
                 actions=["log"],
@@ -132,7 +138,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="Monitoring Tool Disabled",
-                pattern=r'(systemctl|service)\s+(stop|disable|mask)\s+(ash|auditd|rsyslog|syslog|fail2ban|apparmor|selinux)',
+                pattern=r"(systemctl|service)\s+(stop|disable|mask)\s+(ash|auditd|rsyslog|syslog|fail2ban|apparmor|selinux)",
                 severity="critical",
                 description="Attempt to disable monitoring or security tool",
                 actions=["webhook", "log"],
@@ -141,7 +147,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="Container Escape Attempt",
-                pattern=r'(docker|kubectl)\s+(exec|run)\s+.*-(it|interactive)',
+                pattern=r"(docker|kubectl)\s+(exec|run)\s+.*-(it|interactive)",
                 severity="high",
                 description="Interactive container session — possible lateral movement",
                 actions=["webhook", "log"],
@@ -150,7 +156,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="History Tampering",
-                pattern=r'(history\s+-c|unset\s+HISTFILE|export\s+HISTSIZE=0|>/.*\.bash_history|shred.*history)',
+                pattern=r"(history\s+-c|unset\s+HISTFILE|export\s+HISTSIZE=0|>/.*\.bash_history|shred.*history)",
                 severity="critical",
                 description="Attempt to clear or tamper with command history",
                 actions=["webhook", "log"],
@@ -159,7 +165,7 @@ class ASHAlertEngine:
             ),
             AlertRule(
                 name="Kernel Module Loading",
-                pattern=r'(insmod|modprobe|rmmod)\s+',
+                pattern=r"(insmod|modprobe|rmmod)\s+",
                 severity="high",
                 description="Kernel module manipulation",
                 actions=["webhook", "log"],
@@ -173,17 +179,19 @@ class ASHAlertEngine:
             try:
                 with open(config_path) as f:
                     custom = json.load(f)
-                    for rule_def in custom.get('rules', []):
-                        default_rules.append(AlertRule(
-                            name=rule_def['name'],
-                            pattern=rule_def['pattern'],
-                            severity=rule_def.get('severity', 'medium'),
-                            description=rule_def.get('description', ''),
-                            actions=rule_def.get('actions', ['log']),
-                            mitre_id=rule_def.get('mitre', {}).get('technique'),
-                            mitre_tactic=rule_def.get('mitre', {}).get('tactic'),
-                            cooldown_seconds=rule_def.get('cooldown_seconds', 300),
-                        ))
+                    for rule_def in custom.get("rules", []):
+                        default_rules.append(
+                            AlertRule(
+                                name=rule_def["name"],
+                                pattern=rule_def["pattern"],
+                                severity=rule_def.get("severity", "medium"),
+                                description=rule_def.get("description", ""),
+                                actions=rule_def.get("actions", ["log"]),
+                                mitre_id=rule_def.get("mitre", {}).get("technique"),
+                                mitre_tactic=rule_def.get("mitre", {}).get("tactic"),
+                                cooldown_seconds=rule_def.get("cooldown_seconds", 300),
+                            )
+                        )
             except Exception as e:
                 logger.error(f"Error loading custom rules: {e}")
 
@@ -191,12 +199,12 @@ class ASHAlertEngine:
 
     def _load_webhooks(self, config_path: str) -> List[str]:
         webhooks = []
-        webhook_config = os.path.join(os.path.dirname(config_path), 'webhooks.json')
+        webhook_config = os.path.join(os.path.dirname(config_path), "webhooks.json")
         if os.path.exists(webhook_config):
             try:
                 with open(webhook_config) as f:
                     data = json.load(f)
-                    webhooks = data.get('webhook_urls', [])
+                    webhooks = data.get("webhook_urls", [])
             except Exception as e:
                 logger.error(f"Error loading webhooks: {e}")
         return webhooks
@@ -221,10 +229,10 @@ class ASHAlertEngine:
     def _send_webhook(self, rule: AlertRule, event: Dict):
         """Send alert to configured webhook endpoints (Slack format)."""
         severity_colors = {
-            'critical': '#FF0000',
-            'high': '#FF6600',
-            'medium': '#FFAA00',
-            'low': '#00AAFF',
+            "critical": "#FF0000",
+            "high": "#FF6600",
+            "medium": "#FFAA00",
+            "low": "#00AAFF",
         }
 
         mitre_text = ""
@@ -233,17 +241,43 @@ class ASHAlertEngine:
 
         message = {
             "text": f"ASH Alert: {rule.name}{mitre_text}",
-            "attachments": [{
-                "color": severity_colors.get(rule.severity, '#FFAA00'),
-                "fields": [
-                    {"title": "Severity", "value": rule.severity.upper(), "short": True},
-                    {"title": "Host", "value": event.get('hostname', 'unknown'), "short": True},
-                    {"title": "User", "value": event.get('user', 'unknown'), "short": True},
-                    {"title": "Time", "value": event.get('timestamp', ''), "short": True},
-                    {"title": "Command", "value": f"`{event.get('command', '')[:200]}`", "short": False},
-                    {"title": "Description", "value": rule.description, "short": False},
-                ],
-            }],
+            "attachments": [
+                {
+                    "color": severity_colors.get(rule.severity, "#FFAA00"),
+                    "fields": [
+                        {
+                            "title": "Severity",
+                            "value": rule.severity.upper(),
+                            "short": True,
+                        },
+                        {
+                            "title": "Host",
+                            "value": event.get("hostname", "unknown"),
+                            "short": True,
+                        },
+                        {
+                            "title": "User",
+                            "value": event.get("user", "unknown"),
+                            "short": True,
+                        },
+                        {
+                            "title": "Time",
+                            "value": event.get("timestamp", ""),
+                            "short": True,
+                        },
+                        {
+                            "title": "Command",
+                            "value": f"`{event.get('command', '')[:200]}`",
+                            "short": False,
+                        },
+                        {
+                            "title": "Description",
+                            "value": rule.description,
+                            "short": False,
+                        },
+                    ],
+                }
+            ],
         }
 
         for webhook_url in self.webhooks:
@@ -261,15 +295,15 @@ class ASHAlertEngine:
             "description": rule.description,
             "mitre_id": rule.mitre_id,
             "mitre_tactic": rule.mitre_tactic,
-            "hostname": event.get('hostname', 'unknown'),
-            "user": event.get('user', 'unknown'),
-            "command": event.get('command', ''),
-            "session_id": event.get('session_id', ''),
-            "event_id": event.get('event_id', ''),
+            "hostname": event.get("hostname", "unknown"),
+            "user": event.get("user", "unknown"),
+            "command": event.get("command", ""),
+            "session_id": event.get("session_id", ""),
+            "event_id": event.get("event_id", ""),
             "trigger_count": rule.trigger_count,
         }
         try:
-            with open(self.alert_log_path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(alert_record) + '\n')
+            with open(self.alert_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(alert_record) + "\n")
         except Exception as e:
             logger.error(f"Alert log write failed: {e}")
