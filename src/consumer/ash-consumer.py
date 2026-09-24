@@ -20,7 +20,11 @@ from typing import Any, Dict, List, Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 from kafka import KafkaConsumer
-from kafka.errors import NoBrokersAvailable
+
+# kafka-python 3.0 removed NoBrokersAvailableError: a broker-unreachable
+# KafkaConsumer(...) construction now raises KafkaTimeoutError instead. See
+# https://kafka-python.readthedocs.io/en/3.0.1/upgrade_to_3_0.html
+from kafka.errors import KafkaTimeoutError
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 
 # ─── Prometheus Metrics ──────────────────────────────────────────────────────
@@ -342,7 +346,7 @@ class ASHConsumer:
                 )
                 self.logger.info("Kafka consumer initialized")
                 return
-            except NoBrokersAvailable:
+            except KafkaTimeoutError:
                 self.logger.warning(
                     f"Kafka not available, attempt {attempt+1}/{max_retries}"
                 )
