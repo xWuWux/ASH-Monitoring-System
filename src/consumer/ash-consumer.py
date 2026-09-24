@@ -44,6 +44,11 @@ EVENTS_FAILED = Counter(
 EVENTS_DEDUPLICATED = Counter(
     "ash_consumer_events_deduplicated_total", "Total duplicate events skipped"
 )
+EVENTS_DEAD_LETTERED = Counter(
+    "ash_consumer_events_dead_lettered_total",
+    "Total events written to the dead-letter queue instead of being processed",
+    ["reason"],
+)
 BATCH_FLUSH_LATENCY = Histogram(
     "ash_consumer_batch_flush_seconds",
     "Batch flush latency",
@@ -97,13 +102,28 @@ def _connect_db(database_url: str):
     # (a libpq connection option, applied server-side for every query on this
     # connection) bounds how long any single query can run once connected.
     # Without both, an unresponsive Postgres (network partition, overload, a
-    # runaway query) can make a query block indefinitely -- which matters
-    # here specifically because _write_database_batch() runs while
-    # batch_lock is held (see _flush_batch()), so a hung query would freeze
-    # the entire consumer, not just one write.
+    # runaway query) can make a query block indefinitely. _flush_batch() no
+    # longer holds batch_lock across _write_database_batch() (see
+    # _flush_batch() itself), so a hung query no longer freezes the whole
+    # consumer -- but it would still stall that one flush indefinitely
+    # without these timeouts.
     return psycopg2.connect(
         database_url, connect_timeout=10, options="-c statement_timeout=30000"
     )
+
+
+# Maps an AlertRule's severity to the 0-10 risk_score range defined in
+# src/common/schema/event-v1.json. Feeds matched-rule severity back onto the
+# event before it is batched, so risk_score (indexed, and the sole filter on
+# GET /api/v1/stats/risky) is actually populated -- previously nothing ever
+# assigned it, so every row stayed at its schema DEFAULT 0 and that endpoint
+# always returned empty.
+SEVERITY_RISK_SCORE = {
+    "critical": 10,
+    "high": 7,
+    "medium": 4,
+    "low": 2,
+}
 
 
 class ASHConsumer:
@@ -125,9 +145,22 @@ class ASHConsumer:
         self.last_flush: float = time.time()
         self.batch_lock = threading.Lock()
 
+        # Set by _flush_batch() (which can run on the main consume-loop
+        # thread or the background flush-timer thread) whenever it durably
+        # writes a batch; only ever read and cleared on the main
+        # consumer-loop thread, which is the only thread allowed to call
+        # self.consumer.commit() -- KafkaConsumer is not thread-safe.
+        self._commit_pending = threading.Event()
+
         # Storage
         self.log_dir = Path(self.config.get("log_dir", "/var/log/ash"))
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Dead-letter queue: events that fail schema validation were
+        # previously logged at WARNING and silently discarded. Route them
+        # here instead so nothing is lost without a trace and an operator
+        # can inspect/replay them.
+        self.dlq_path = self.log_dir / "dead_letter.jsonl"
 
         # Database
         self.db_conn: Optional[psycopg2.extensions.connection] = None
@@ -353,7 +386,14 @@ class ASHConsumer:
                     group_id=self.config["kafka_group_id"],
                     value_deserializer=lambda x: json.loads(x.decode("utf-8")),
                     auto_offset_reset="latest",
-                    enable_auto_commit=True,
+                    # Was True: offsets were committed on a fixed
+                    # background timer regardless of whether the consumed
+                    # events had actually been flushed to file/DB yet. A
+                    # crash between poll and flush silently lost up to
+                    # batch_size - 1 events, since Kafka never redelivers
+                    # an already-committed offset. Commits are now issued
+                    # explicitly, only after a flush succeeds (see run()).
+                    enable_auto_commit=False,
                     max_poll_interval_ms=300000,
                     session_timeout_ms=30000,
                     heartbeat_interval_ms=10000,
@@ -379,6 +419,21 @@ class ASHConsumer:
                 return False
         return True
 
+    def _write_dead_letter(self, event: Dict[str, Any], reason: str):
+        """Persist an event that could not be processed instead of silently
+        dropping it, so it can be inspected/replayed later."""
+        EVENTS_DEAD_LETTERED.labels(reason=reason).inc()
+        try:
+            record = {
+                "dlq_timestamp": datetime.utcnow().isoformat() + "Z",
+                "reason": reason,
+                "event": event,
+            }
+            with open(self.dlq_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception as e:
+            self.logger.error(f"Failed to write dead-letter record: {e}")
+
     def _deduplicate(self, event_id: str) -> bool:
         if event_id in self.seen_event_ids:
             EVENTS_DEDUPLICATED.inc()
@@ -397,6 +452,7 @@ class ASHConsumer:
                 self.logger.warning(
                     f"Invalid event schema: {log_data.get('event_id', 'unknown')}"
                 )
+                self._write_dead_letter(log_data, "missing_field")
                 return
 
             event_id = log_data.get("event_id", "")
@@ -408,9 +464,16 @@ class ASHConsumer:
             event_type = log_data.get("event_type", "unknown")
             EVENTS_RECEIVED.labels(source=source, event_type=event_type).inc()
 
-            # Alerting
+            # Alerting -- feed matched-rule severity back into risk_score
+            # (see SEVERITY_RISK_SCORE) so it's actually non-zero for
+            # anything the alert engine flagged.
             if self.alert_engine:
-                self.alert_engine.check_event(log_data)
+                matched_rules = self.alert_engine.check_event(log_data)
+                if matched_rules:
+                    log_data["risk_score"] = max(
+                        SEVERITY_RISK_SCORE.get(rule.severity, 0)
+                        for rule in matched_rules
+                    )
 
             # Add to batch buffer. _flush_batch() manages batch_lock itself
             # and does the actual (potentially slow) file/DB writes outside
@@ -461,6 +524,13 @@ class ASHConsumer:
 
             self.last_flush = time.time()
             EVENTS_PROCESSED.inc(len(batch))
+            # Signal the main consumer-loop thread that it's now safe to
+            # advance committed Kafka offsets past these events (they are
+            # durably on disk / in the DB). Set here so this covers both a
+            # size-triggered flush (main thread) and a timeout-triggered
+            # flush (background flush-timer thread) -- threading.Event is
+            # itself thread-safe, so this needs no lock.
+            self._commit_pending.set()
 
         except Exception as e:
             self.logger.error(f"Batch flush failed: {e}")
@@ -556,6 +626,40 @@ class ASHConsumer:
                             template="""(%s, %s, %s, %s, %s, %s, %s, %s::uuid, %s, %s,
                                          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                          %s, %s, %s, %s::jsonb, %s::timestamp)""",
+                        )
+
+                    # Bulk insert file-change events. file_events was
+                    # already classified above and then never used --
+                    # nothing was ever inserted into file_changes, so
+                    # "file change tracking + diffs" (this project's
+                    # headline differentiator per docs/PROJECT_REPORT.md)
+                    # was completely unqueryable via the DB or the API.
+                    if file_events:
+                        file_values = [
+                            (
+                                e.get("event_id"),
+                                e.get("hostname", "unknown"),
+                                e.get("user", e.get("username", "")),
+                                e.get("session_id"),
+                                e.get("file_path"),
+                                e.get("event_type"),
+                                e.get("diff_content"),
+                                e.get("command", ""),
+                                e.get("source", "unknown"),
+                                e.get("timestamp"),
+                            )
+                            for e in file_events
+                        ]
+                        execute_values(
+                            cursor,
+                            """INSERT INTO file_changes
+                            (event_id, hostname, username, session_id, file_path,
+                             change_type, diff_content, command, source, timestamp)
+                            VALUES %s
+                            ON CONFLICT (event_id) DO NOTHING""",
+                            file_values,
+                            template="""(%s, %s, %s, %s::uuid, %s, %s, %s, %s, %s,
+                                         %s::timestamp)""",
                         )
 
                     # Handle sessions
@@ -702,6 +806,17 @@ class ASHConsumer:
                     break
                 self.process_message(message.value)
 
+                # Commit only from this thread (KafkaConsumer.commit() is
+                # not thread-safe) and only once a flush has actually
+                # persisted data -- see enable_auto_commit=False above and
+                # the _commit_pending.set() call in _flush_batch().
+                if self._commit_pending.is_set():
+                    try:
+                        self.consumer.commit()
+                        self._commit_pending.clear()
+                    except Exception as e:
+                        self.logger.error(f"Offset commit failed: {e}")
+
         except KeyboardInterrupt:
             self.logger.info("Consumer interrupted by user")
         except Exception as e:
@@ -717,6 +832,15 @@ class ASHConsumer:
         # _flush_batch() takes batch_lock itself and no-ops on an empty
         # buffer, so it's always safe to call directly here.
         self._flush_batch()
+
+        # Commit the final flush's offsets before closing -- same thread as
+        # run()'s loop (called from its `finally`), so this is safe.
+        if hasattr(self, "consumer") and self._commit_pending.is_set():
+            try:
+                self.consumer.commit()
+                self._commit_pending.clear()
+            except Exception as e:
+                self.logger.error(f"Final offset commit failed: {e}")
 
         if hasattr(self, "consumer"):
             self.consumer.close()
