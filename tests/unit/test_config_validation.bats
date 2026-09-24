@@ -29,7 +29,12 @@ run_validate_config() {
 
     run timeout 10s bash --noprofile --norc -c '
         set +e
-        source "$1" >/dev/null 2>&1 || true
+        # --functions-only: define validate_config et al without running
+        # main() (which starts background watchers, the hash chain, spool
+        # flush timer, ...). Without this, sourcing runs the full agent
+        # startup and this whole isolated-child-process trick still hangs
+        # or silently swallows the real validate_config() result inside it.
+        source "$1" --functions-only >/dev/null 2>&1 || true
 
         # Avoid leaking agent DEBUG/RETURN/ERR/EXIT traps into validation execution.
         trap - DEBUG RETURN ERR EXIT 2>/dev/null || true
