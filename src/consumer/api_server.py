@@ -13,12 +13,25 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, jsonify, request
 
+
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(
+            f"{name} is not set. Refusing to start with an insecure "
+            "built-in default -- see deployments/docker/.env.example, or "
+            "scripts/install.sh's generate_api_secrets for how to "
+            "generate one. A previous fixed, publicly-known default here "
+            '(the literal string "change-me-in-production") let anyone '
+            "who had read this file forge a valid admin JWT."
+        )
+    return value
+
+
 app = Flask(__name__)
-app.config["JWT_SECRET"] = os.environ.get("ASH_JWT_SECRET", "change-me-in-production")
+app.config["JWT_SECRET"] = _require_env("ASH_JWT_SECRET")
 app.config["JWT_EXPIRY_HOURS"] = int(os.environ.get("ASH_JWT_EXPIRY_HOURS", "24"))
-DATABASE_URL = os.environ.get(
-    "ASH_DATABASE_URL", "postgresql://ash:password@localhost/ash_logs"
-)
+DATABASE_URL = _require_env("ASH_DATABASE_URL")
 
 # ─── RBAC ─────────────────────────────────────────────────────────────────────
 ROLE_PERMISSIONS = {
