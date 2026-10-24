@@ -248,6 +248,8 @@ fi
 echo "Event ${EVENT_ID} produced; waiting for PostgreSQL row..."
 
 python3 - "$ASH_DATABASE_URL" "$EVENT_ID" "$COMMAND" "$HOSTNAME_VALUE" "$TIMEOUT" <<'PY'
+import hashlib
+import re
 import sys
 import time
 
@@ -264,7 +266,8 @@ try:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT command, hostname, prev_hash, event_hash
+                SELECT command, hostname, prev_hash, event_hash,
+                       raw_event_text
                 FROM command_logs
                 WHERE event_id = %s
                 """,
@@ -280,14 +283,42 @@ try:
         print(f"event {event_id} was not written to PostgreSQL in {timeout}s", file=sys.stderr)
         sys.exit(1)
 
-    command, hostname, prev_hash, event_hash = row
+    command, hostname, prev_hash, event_hash, raw_event_text = row
     assert command == expected_command, (command, expected_command)
     assert hostname == expected_host, (hostname, expected_host)
     assert prev_hash and len(prev_hash) == 64, prev_hash
     assert event_hash and len(event_hash) == 64, event_hash
+    assert raw_event_text, "raw_event_text was not stored"
+
+    # The agent signs sha256(prev_hash || unsigned_event_json) and then
+    # appends ,"prev_hash":...,"event_hash":... before producing the line.
+    # Recover those exact bytes from the stored raw text (JSONB cannot
+    # reproduce them) and recompute the hash. This proves the value that
+    # crossed Kafka is verifiable, not merely that some JSONB exists.
+    match = re.match(
+        r'^(.*),"prev_hash":"([0-9a-f]{64})","event_hash":"([0-9a-f]{64})"}$',
+        raw_event_text,
+        re.DOTALL,
+    )
+    assert match, (
+        "raw_event_text does not end with the agent's signed fields: "
+        f"{raw_event_text[:200]!r}"
+    )
+    unsigned, signed_prev, signed_hash = match.groups()
+    # The regex consumed the closing brace that the agent replaced with the
+    # two hash fields; put it back to recover the exact hashed JSON.
+    unsigned += "}"
+    assert signed_prev == prev_hash, (signed_prev, prev_hash)
+    assert signed_hash == event_hash, (signed_hash, event_hash)
+    recomputed = hashlib.sha256(
+        (prev_hash + unsigned).encode("utf-8")
+    ).hexdigest()
+    assert recomputed == event_hash, (recomputed, event_hash)
+    assert f'"event_id":"{event_id}"' in unsigned, unsigned[:200]
+
     print(
         f"Kafka E2E passed: {event_id} -> {hostname} -> "
-        f"{command!r} (hashes present)"
+        f"{command!r} (raw text hash verified)"
     )
 finally:
     conn.close()

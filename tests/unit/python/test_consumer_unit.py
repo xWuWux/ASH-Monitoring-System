@@ -1,6 +1,10 @@
 """Unit tests for the Kafka consumer's processing and local-write logic."""
 
 import json
+import time
+
+import psycopg2
+import pytest
 
 
 def test_constructor_creates_log_dir_before_configuring_logging(
@@ -215,3 +219,340 @@ def test_dedup_cache_evicts_oldest_entries(consumer_factory):
         if event_id not in consumer.seen_event_ids
     )
     assert consumer._deduplicate(evicted) is False
+
+
+# ─── Strict event validation ─────────────────────────────────────────────────
+
+
+def test_validation_accepts_a_complete_event(consumer_factory, event_factory):
+    consumer = consumer_factory()
+
+    assert consumer._validate_event(event_factory()) == (True, "")
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("event_id", "not-a-uuid", "invalid_uuid"),
+        ("session_id", "not-a-uuid", "invalid_uuid"),
+        ("timestamp", "yesterday", "invalid_timestamp"),
+        ("event_type", "not_an_event", "invalid_event_type"),
+        ("source", "not-a-source", "invalid_source"),
+        ("hostname", "", "missing_field"),
+    ],
+)
+def test_validation_classifies_malformed_fields(
+    consumer_factory, event_factory, field, value, reason
+):
+    consumer = consumer_factory()
+    event = event_factory(**{field: value})
+
+    assert consumer._validate_event(event) == (False, reason)
+
+
+def test_validation_rejects_non_objects_and_wrong_types(
+    consumer_factory, event_factory
+):
+    consumer = consumer_factory()
+
+    assert consumer._validate_event(["not", "an", "object"]) == (
+        False,
+        "not_an_object",
+    )
+    assert consumer._validate_event(event_factory(uid="1000")) == (
+        False,
+        "invalid_type",
+    )
+    assert consumer._validate_event(event_factory(duration_ms="soon")) == (
+        False,
+        "invalid_type",
+    )
+
+
+def test_validation_rejects_values_wider_than_the_column(
+    consumer_factory, event_factory, consumer_module, monkeypatch
+):
+    consumer = consumer_factory()
+    monkeypatch.setitem(consumer_module.MAX_FIELD_LENGTHS, "hostname", 4)
+
+    assert consumer._validate_event(event_factory(hostname="too-long")) == (
+        False,
+        "field_too_long",
+    )
+
+
+def test_invalid_event_records_its_specific_reason(consumer_factory, event_factory):
+    consumer = consumer_factory()
+    event = event_factory(event_type="not_an_event")
+
+    consumer.process_message(event)
+
+    record = json.loads(consumer.dlq_path.read_text().strip())
+    assert record["reason"] == "invalid_event_type"
+    assert record["event"]["event_id"] == event["event_id"]
+    assert consumer.batch_buffer == []
+
+
+# ─── Raw Kafka payload handling ──────────────────────────────────────────────
+
+
+def test_process_message_keeps_the_exact_raw_text(consumer_factory, event_factory):
+    consumer = consumer_factory()
+    event = event_factory()
+    raw_text = json.dumps(event)
+
+    consumer.process_message(event, raw_event_text=raw_text)
+
+    assert consumer.batch_raw_texts == [raw_text]
+
+
+@pytest.mark.parametrize(
+    "value,reason,raw_prefix",
+    [
+        (b"{not json", "invalid_json", "{not json"),
+        (b"[]", "not_an_object", "[]"),
+        (b"\xff\xfe", "invalid_utf8", "\ufffd"),
+        (123, "unsupported_payload", None),
+    ],
+)
+def test_decode_message_rejects_poison_payloads(
+    consumer_factory, value, reason, raw_prefix
+):
+    consumer = consumer_factory()
+
+    raw_text, event, error = consumer._decode_message(value)
+
+    assert event is None
+    assert error == reason
+    if raw_prefix is None:
+        assert raw_text is None
+    else:
+        assert raw_text.startswith(raw_prefix)
+
+
+def test_decode_message_rejects_oversized_payloads(
+    consumer_factory, consumer_module, monkeypatch
+):
+    consumer = consumer_factory()
+    monkeypatch.setattr(consumer_module, "MAX_RAW_EVENT_LENGTH", 10)
+
+    raw_text, event, error = consumer._decode_message(b'{"a": 1, "b": 2}')
+
+    assert event is None
+    assert error == "raw_too_long"
+    assert raw_text == '{"a": 1, "'
+
+
+def test_flush_pads_missing_raw_texts(consumer_factory, event_factory, monkeypatch):
+    consumer = consumer_factory()
+    consumer.config["database_enabled"] = True
+    consumer.batch_buffer = [event_factory()]
+    consumer.batch_raw_texts = []
+    captured = {}
+
+    def capture(_batch, raw_texts):
+        captured["raw_texts"] = raw_texts
+        return True
+
+    monkeypatch.setattr(consumer, "_write_database_batch", capture)
+    consumer._flush_batch()
+
+    assert captured["raw_texts"] == [None]
+
+
+# ─── PostgreSQL persistence and per-row fallback ─────────────────────────────
+
+
+class _RecordingCursor:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class _RecordingConnection:
+    def __init__(self):
+        self.autocommit = False
+        self.commits = 0
+        self.rollbacks = 0
+        self.executed = []
+
+    def cursor(self, **_kwargs):
+        return _RecordingCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def close(self):
+        pass
+
+
+def test_database_batch_stores_the_exact_raw_text(
+    consumer_factory, event_factory, consumer_module, monkeypatch
+):
+    consumer = consumer_factory()
+    consumer.config["database_enabled"] = True
+    connection = _RecordingConnection()
+    consumer.db_conn = connection
+    event = event_factory()
+    raw_text = json.dumps(event, separators=(",", ":"))
+
+    def record_command_rows(cursor, sql, values, template=None):
+        if "INSERT INTO command_logs" in sql:
+            cursor.connection.executed.extend(values)
+
+    monkeypatch.setattr(consumer_module, "execute_values", record_command_rows)
+
+    consumer._write_database_batch([event], [raw_text])
+
+    assert connection.executed[0][25] == raw_text
+    assert connection.executed[0][24] == json.dumps(event, default=str)
+    assert connection.commits == 1
+    assert consumer_module.DB_AVAILABLE._value.get() == 1
+
+
+def test_failed_batch_retries_rows_and_dlqs_only_the_bad_row(
+    consumer_factory, event_factory, consumer_module, monkeypatch
+):
+    consumer = consumer_factory()
+    consumer.config["database_enabled"] = True
+    connection = _RecordingConnection()
+    consumer.db_conn = connection
+    good = event_factory()
+    bad = event_factory()
+
+    def reject_bad_row(cursor, sql, values, template=None):
+        if "INSERT INTO command_logs" not in sql:
+            return
+        if len(values) > 1 or values[0][0] == bad["event_id"]:
+            raise psycopg2.DataError("invalid input syntax")
+        cursor.connection.executed.extend(values)
+
+    monkeypatch.setattr(consumer_module, "execute_values", reject_bad_row)
+
+    assert consumer._write_database_batch([good, bad], ["good", "bad"]) is True
+
+    assert [row[0] for row in connection.executed] == [good["event_id"]]
+    records = [json.loads(line) for line in consumer.dlq_path.read_text().splitlines()]
+    assert [record["reason"] for record in records] == ["db_row_error"]
+    assert records[0]["event"]["event_id"] == bad["event_id"]
+    assert consumer_module.DB_AVAILABLE._value.get() == 1
+
+
+def test_database_outage_marks_the_gauge_unavailable(
+    consumer_factory, event_factory, consumer_module
+):
+    consumer = consumer_factory()
+    consumer.config["database_enabled"] = True
+    consumer.db_conn = _RecordingConnection()
+
+    def fail_cursor(**_kwargs):
+        raise ValueError("unexpected failure")
+
+    consumer.db_conn.cursor = fail_cursor
+
+    with pytest.raises(consumer_module.DatabaseWriteError):
+        consumer._write_database_batch([event_factory()], ["raw"])
+
+    assert consumer_module.DB_AVAILABLE._value.get() == 0
+    assert consumer.db_conn.rollbacks == 1
+
+
+# ─── Consume loop ────────────────────────────────────────────────────────────
+
+
+class _Message:
+    def __init__(self, value):
+        self.value = value
+
+
+class _FakeKafkaConsumer:
+    def __init__(self, messages, failure=None):
+        self._messages = iter(messages)
+        self._failure = failure
+        self.commits = 0
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._failure is not None:
+            raise self._failure
+        return next(self._messages)
+
+    def metrics(self):
+        return {"records-lag-max": 7.0}
+
+    def commit(self):
+        self.commits += 1
+
+    def close(self):
+        self.closed = True
+
+
+def test_run_dead_letters_poison_payloads_and_keeps_consuming(
+    consumer_factory, event_factory, consumer_module
+):
+    consumer = consumer_factory(batch_size=1)
+    raw_text = json.dumps(event_factory())
+    fake = _FakeKafkaConsumer([_Message(b"{not json"), _Message(raw_text.encode())])
+    consumer.consumer = fake
+
+    consumer.run()
+
+    records = [json.loads(line) for line in consumer.dlq_path.read_text().splitlines()]
+    assert [record["reason"] for record in records] == ["invalid_json"]
+    written = consumer.log_dir / "ash-history-smoke-host.jsonl"
+    assert len(written.read_text().splitlines()) == 1
+    assert fake.commits == 1
+    assert fake.closed is True
+    assert consumer_module.KAFKA_LAG._value.get() == 7.0
+
+
+def test_run_raises_on_a_fatal_loop_error(consumer_factory):
+    consumer = consumer_factory()
+    fake = _FakeKafkaConsumer([], failure=RuntimeError("broker broke"))
+    consumer.consumer = fake
+
+    with pytest.raises(RuntimeError, match="broker broke"):
+        consumer.run()
+
+    assert fake.closed is True
+
+
+def test_flush_timer_flushes_under_the_processing_lock(
+    consumer_factory, event_factory, consumer_module, monkeypatch
+):
+    consumer = consumer_factory()
+    consumer.batch_buffer = [event_factory()]
+    consumer.batch_raw_texts = [None]
+    consumer.last_flush = time.time() - 10
+    consumer.batch_timeout = 0
+    flushed = []
+
+    def fake_flush():
+        flushed.append(consumer._processing_lock.locked())
+        consumer.running = False
+
+    class _ImmediateThread:
+        def __init__(self, target, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr(consumer, "_flush_batch", fake_flush)
+    monkeypatch.setattr(consumer_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(consumer_module.threading, "Thread", _ImmediateThread)
+
+    consumer._start_flush_timer()
+
+    assert flushed == [True]

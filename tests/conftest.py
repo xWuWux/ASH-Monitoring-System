@@ -56,6 +56,7 @@ def _build_consumer(module, tmp_path: Path, **overrides):
     consumer.config = {
         "database_enabled": False,
         "database_url": "postgresql://unused",
+        "kafka_topic": "ash-logs-test",
         "batch_size": 100,
         "batch_timeout": 5.0,
         "max_dedup_cache": 100000,
@@ -73,10 +74,12 @@ def _build_consumer(module, tmp_path: Path, **overrides):
     consumer.seen_event_ids = set()
     consumer.max_seen_ids = consumer.config["max_dedup_cache"]
     consumer.batch_buffer = []
+    consumer.batch_raw_texts = []
     consumer.batch_size = consumer.config["batch_size"]
     consumer.batch_timeout = consumer.config["batch_timeout"]
     consumer.last_flush = time.time()
     consumer.batch_lock = threading.Lock()
+    consumer._processing_lock = threading.Lock()
     consumer._commit_pending = threading.Event()
 
     consumer.log_dir = log_dir

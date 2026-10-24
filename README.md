@@ -422,6 +422,11 @@ class ASHConsumer:
                     hostname VARCHAR(100),
                     command TEXT NOT NULL,
                     output TEXT,
+                    -- Exact signed line received from Kafka. The JSONB copy
+                    -- below cannot reproduce the bytes that were hashed, so
+                    -- this column is what future integrity checks use.
+                    raw_event JSONB,
+                    raw_event_text TEXT,
                     exit_code INTEGER,
                     log_timestamp TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -450,9 +455,14 @@ class ASHConsumer:
                 self.config['kafka_topic'],
                 bootstrap_servers=self.config['kafka_brokers'],
                 group_id=self.config['kafka_group_id'],
-                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+                # Keep the raw bytes so the exact signed line can be stored.
+                # Parsing happens in the consumer loop, where a malformed
+                # payload can be dead-lettered instead of crashing the iterator.
+                value_deserializer=lambda x: x,
                 auto_offset_reset='latest',
-                enable_auto_commit=True
+                # Offsets are committed only after PostgreSQL and the local
+                # JSONL write succeed; a database outage must block progress.
+                enable_auto_commit=False
             )
             self.logger.info("Kafka consumer initialized")
         except Exception as e:
@@ -561,8 +571,11 @@ if __name__ == "__main__":
 - **Configuration Management**: Loads settings from JSON config file
 - **Kafka Integration**: Consumes messages from Kafka topic with proper error handling
 - **Dual Storage**: Writes logs to both files and PostgreSQL database
+- **Durable offsets**: Commits a Kafka offset only after the PostgreSQL transaction and the local JSONL append both succeed. A database outage keeps the batch in memory, leaves the offset uncommitted, and exposes `ash_consumer_database_available` plus Kafka lag.
+- **Validation and DLQ**: Validates UUIDs, ISO-8601 timestamps, allow-listed event types/sources, field types, and column-width limits. Malformed payloads and rejected events go to `dead_letter.jsonl`; if a batch still fails, rows are retried individually so one bad row cannot poison the rest.
+- **Exact raw text**: Stores the exact signed line in `command_logs.raw_event_text`, alongside the JSONB copy, so future integrity checks can recompute `sha256(prev_hash || event_json)`.
 - **Signal Handling**: Graceful shutdown on SIGTERM/SIGINT
-- **Error Recovery**: Robust error handling with logging
+- **Error Recovery**: Fatal consumer-loop failures exit non-zero so an on-failure supervisor restarts the process
 
 ---
 

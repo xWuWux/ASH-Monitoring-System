@@ -147,8 +147,12 @@ lost database connections, and crash recovery on every CI build.
 PostgreSQL smoke test, including a 50-concurrent-request p95 latency check.
 `tests/integration/kafka-e2e.sh` runs the real wire path on every push/PR:
 the real agent producer → a real Kafka broker → the real Python consumer →
-PostgreSQL, asserting the stored row and both hash fields. It uses no fake
-producer or in-process mock. `tests/unit/test_events.bats` covers concurrent
+PostgreSQL, asserting the stored row, both hash fields, `raw_event_text`, and
+a hash recomputed from the exact stored line. It uses no fake producer or
+in-process mock. The consumer's database-outage path is covered by
+degradation tests: the batch is retained, the Kafka offset is not committed,
+the local JSONL is not written, and `ash_consumer_database_available` drops
+to 0. `tests/unit/test_events.bats` covers concurrent
 hash-chain writers and subshell temp-file collisions. Still **not automated**:
 disk-full, OOM-kill, network-partition (`tc netem` is unavailable/unreliable
 on hosted runners), and spool-corruption scenarios.

@@ -16,7 +16,7 @@ every push and pull request.
 | `tests/security/python/` | API responses never echo credentials, tokens, or DB URLs |
 | `tests/contract/` | API response contract against real PostgreSQL: every endpoint, filters, pagination, invalid input, RBAC |
 | `tests/smoke/smoke-api.sh` | Real gunicorn API + PostgreSQL: health, auth, search, RBAC rejection, load check |
-| `tests/integration/kafka-e2e.sh` | Real Kafka + Zookeeper + PostgreSQL: agent producer → broker → Python consumer → DB row, with hash-chain assertions |
+| `tests/integration/kafka-e2e.sh` | Real Kafka + Zookeeper + PostgreSQL: agent producer → broker → Python consumer → DB row, with raw-text storage and hash-recomputation assertions |
 | `tests/performance/load_api.py` | 50 concurrent `GET /api/v1/events` requests, p95 < 500ms |
 | `tests/performance/benchmark.sh` | Report-only hash-chain + redaction throughput |
 

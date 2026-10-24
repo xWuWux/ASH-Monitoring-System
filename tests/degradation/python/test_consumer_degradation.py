@@ -46,6 +46,7 @@ def test_database_setup_gives_up_after_retries(consumer_module, monkeypatch):
 
     assert len(attempts) == 3
     assert consumer.db_conn is None
+    assert consumer_module.DB_AVAILABLE._value.get() == 0
 
 
 def test_kafka_setup_exits_after_all_attempts(consumer_module, monkeypatch):
@@ -76,12 +77,15 @@ def test_kafka_setup_exits_after_all_attempts(consumer_module, monkeypatch):
     assert len(attempts) == 5
 
 
-def test_flush_survives_a_lost_database_connection(
+def test_flush_blocks_commit_when_the_database_stays_down(
     consumer_factory, event_factory, consumer_module, monkeypatch
 ):
     consumer = consumer_factory()
+    consumer.config["database_enabled"] = True
     consumer.db_conn = _BrokenConnection()
-    consumer.batch_buffer = [event_factory()]
+    event = event_factory()
+    consumer.batch_buffer = [event]
+    consumer.batch_raw_texts = ['{"event_id":"raw"}']
 
     reconnect_attempts = []
 
@@ -94,18 +98,21 @@ def test_flush_survives_a_lost_database_connection(
 
     consumer._flush_batch()
 
-    # The local file is the durable fallback while Postgres is unavailable.
-    written = consumer.log_dir / "ash-history-smoke-host.jsonl"
-    assert written.exists()
+    # PostgreSQL is the API's source of truth: the batch must stay pending
+    # and its offset must not be committed. The local JSONL is not written
+    # first, because every retry would duplicate it.
     assert len(reconnect_attempts) == 3
-    assert consumer.batch_buffer == []
-    assert consumer._commit_pending.is_set()
+    assert consumer.batch_buffer == [event]
+    assert consumer.batch_raw_texts == ['{"event_id":"raw"}']
+    assert not (consumer.log_dir / "ash-history-smoke-host.jsonl").exists()
+    assert not consumer._commit_pending.is_set()
 
 
-def test_flush_rolls_back_on_an_unexpected_database_error(
+def test_flush_blocks_commit_on_an_unexpected_database_error(
     consumer_factory, event_factory, consumer_module, monkeypatch
 ):
     consumer = consumer_factory()
+    consumer.config["database_enabled"] = True
     connection = _BadWriteConnection()
     consumer.db_conn = connection
     consumer.batch_buffer = [event_factory()]
@@ -114,8 +121,9 @@ def test_flush_rolls_back_on_an_unexpected_database_error(
     consumer._flush_batch()
 
     assert connection.rolled_back is True
-    assert (consumer.log_dir / "ash-history-smoke-host.jsonl").exists()
-    assert consumer._commit_pending.is_set()
+    assert consumer.batch_buffer
+    assert not (consumer.log_dir / "ash-history-smoke-host.jsonl").exists()
+    assert not consumer._commit_pending.is_set()
 
 
 def test_invalid_event_does_not_stop_following_events(consumer_factory, event_factory):
