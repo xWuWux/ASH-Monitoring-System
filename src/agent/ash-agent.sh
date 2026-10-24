@@ -47,6 +47,9 @@ DOCKER_MONITOR_ENABLED="${DOCKER_MONITOR_ENABLED:-false}"
 MAX_COMMANDS_PER_SECOND="${MAX_COMMANDS_PER_SECOND:-50}"
 MAX_OUTPUT_SIZE="${MAX_OUTPUT_SIZE:-1048576}"
 ASH_SPOOL_MAX_SIZE="${ASH_SPOOL_MAX_SIZE:-1073741824}"
+# Domain: integer seconds >= 1. Must stay comfortably below the unit's
+# WatchdogSec=30 so one missed kick does not trigger a restart.
+ASH_WATCHDOG_INTERVAL="${ASH_WATCHDOG_INTERVAL:-10}"
 
 WATCHED_FILES=(
     "/etc/passwd"
@@ -139,6 +142,12 @@ validate_config() {
     if ! [[ "${MAX_OUTPUT_SIZE}" =~ ^[0-9]+$ ]] ||
         [[ "${MAX_OUTPUT_SIZE}" -lt 1024 ]]; then
         echo "ERROR: MAX_OUTPUT_SIZE must be an integer >= 1024" >&2
+        errors=$((errors + 1))
+    fi
+
+    if ! [[ "${ASH_WATCHDOG_INTERVAL}" =~ ^[0-9]+$ ]] ||
+        [[ "${ASH_WATCHDOG_INTERVAL}" -lt 1 ]]; then
+        echo "ERROR: ASH_WATCHDOG_INTERVAL must be an integer >= 1" >&2
         errors=$((errors + 1))
     fi
 
@@ -792,9 +801,6 @@ log_command() {
         fi
         emit_event "privilege_escalation" "$priv_extra"
     fi
-
-    # Systemd watchdog kick
-    systemd-notify WATCHDOG=1 2>/dev/null || true
 }
 
 # ─── PROMPT_COMMAND Integration ──────────────────────────────────────────────
@@ -971,23 +977,27 @@ recover_state() {
     rm -f "${ASH_STATE_FILE}"
 }
 
-# ─── Prometheus Metrics ──────────────────────────────────────────────────────
-write_prometheus_metrics() {
-    local metrics_file="${ASH_TEMP_DIR}/ash_metrics.prom"
-    cat >"$metrics_file" <<EOF
-# HELP ash_agent_events_total Total events logged by ASH agent
-# TYPE ash_agent_events_total counter
-ash_agent_events_total ${EVENTS_LOGGED:-0}
-# HELP ash_agent_spool_pending Pending events in spool queue
-# TYPE ash_agent_spool_pending gauge
-ash_agent_spool_pending $(ls "${ASH_SPOOL_DIR}/pending/" 2>/dev/null | wc -l)
-# HELP ash_agent_uptime_seconds Agent uptime in seconds
-# TYPE ash_agent_uptime_seconds gauge
-ash_agent_uptime_seconds $(($(date +%s) - ASH_START_TIME))
-# HELP ash_agent_info Agent version and metadata
-# TYPE ash_agent_info gauge
-ash_agent_info{version="${ASH_VERSION}",hostname="$(hostname)"} 1
-EOF
+# ─── systemd Watchdog ───────────────────────────────────────────────────────
+# The old implementation called systemd-notify only from log_command(), so a
+# host that went idle for WatchdogSec was restarted by systemd even though
+# the agent was healthy.  A dedicated heartbeat is independent of traffic.
+watchdog_kick() {
+    [[ -z "${NOTIFY_SOCKET:-}" ]] && return 0
+    systemd-notify WATCHDOG=1 2>/dev/null || true
+}
+
+start_watchdog() {
+    [[ -z "${NOTIFY_SOCKET:-}" ]] && return 0
+    # Type=notify waits for this; NotifyAccess=all in the unit allows the
+    # helper process to send it.
+    systemd-notify --ready 2>/dev/null || true
+    (
+        while true; do
+            watchdog_kick
+            sleep "${ASH_WATCHDOG_INTERVAL}"
+        done
+    ) &
+    echo "$!" >"${ASH_TEMP_DIR}/watchdog.pid"
 }
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
@@ -1044,6 +1054,9 @@ main() {
 
     # Emit session start
     emit_session_start
+
+    # Start the systemd liveness heartbeat (no-op outside systemd).
+    start_watchdog
 
     # Set up command trapping
     trap 'log_command' DEBUG

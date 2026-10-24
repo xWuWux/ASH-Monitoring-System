@@ -145,7 +145,10 @@ config = {
     "archive_days": 30,
     "archive_path": f"{log_dir}/archive",
     "alerting_enabled": False,
+    "metrics_host": "127.0.0.1",
     "metrics_port": int(metrics_port),
+    "log_max_bytes": 1048576,
+    "log_backup_count": 2,
 }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(config, handle)
@@ -174,6 +177,35 @@ wait_for_log() {
 }
 
 wait_for_log "Kafka consumer initialized"
+
+echo "Waiting for consumer readiness endpoint..."
+python3 - "$METRICS_PORT" "$TIMEOUT" <<'PY'
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+port, timeout = int(sys.argv[1]), int(sys.argv[2])
+url = f"http://127.0.0.1:{port}/health/ready"
+deadline = time.monotonic() + timeout
+last_error = None
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            payload = json.load(response)
+        assert payload["status"] == "ready", payload
+        assert payload["checks"]["database"] == "connected", payload
+        assert payload["checks"]["flush"] == "ok", payload
+        print(f"health: ready ({payload['checks']})")
+        break
+    except Exception as error:  # noqa: BLE001 - retry loop
+        last_error = error
+        time.sleep(1)
+else:
+    print(f"consumer did not become ready in {timeout}s: {last_error}", file=sys.stderr)
+    sys.exit(1)
+PY
 
 # KafkaConsumer assigns partitions on its first poll. Producing before that
 # can lose the message with auto_offset_reset=latest, so wait for the group's
@@ -322,4 +354,41 @@ try:
     )
 finally:
     conn.close()
+PY
+
+echo "Checking consumer metrics and structured logs..."
+python3 - "$METRICS_PORT" "$WORK_DIR/consumer.log" <<'PY'
+import json
+import re
+import sys
+import urllib.request
+
+port, log_path = int(sys.argv[1]), sys.argv[2]
+
+with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as response:
+    metrics = response.read().decode("utf-8")
+
+def value(name):
+    match = re.search(rf"^{re.escape(name)} ([0-9.eE+-]+)$", metrics, re.MULTILINE)
+    assert match, f"metric {name} missing"
+    return float(match.group(1))
+
+assert value("ash_consumer_events_processed_total") >= 1
+assert value("ash_consumer_database_available") == 1
+assert value("ash_consumer_ready") == 1
+assert value("ash_consumer_last_flush_success_timestamp_seconds") > 0
+
+required = {"timestamp", "severity", "component", "logger", "message", "pid"}
+records = []
+with open(log_path, encoding="utf-8") as handle:
+    for line in handle:
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        assert required <= set(record), record
+        assert record["component"] == "ash-consumer", record
+        records.append(record)
+assert any("Kafka consumer initialized" in record["message"] for record in records)
+print(f"observability: metrics present; {len(records)} JSON log records validated")
 PY

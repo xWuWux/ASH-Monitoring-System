@@ -4,7 +4,19 @@ After=network.target kafka.service postgresql.service
 Wants=kafka.service postgresql.service
 
 [Service]
-Type=simple
+# Type=notify: ash-consumer sends READY=1 after initialization and the
+# observability-listener attempt, then WATCHDOG=1 every 10s. Readiness
+# details (database/flush state) stay on /health/ready because a process can
+# be healthy while PostgreSQL is temporarily unavailable.
+# Previously systemd treated a process that had not connected to anything as
+# started, and no watchdog existed at all.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
+# Startup includes bounded PostgreSQL (3 attempts) and Kafka (5 attempts)
+# retry loops. This must exceed their combined backoff, or systemd kills a
+# process that is still correctly retrying.
+TimeoutStartSec=180
 User=ash
 Group=ash
 ExecStart=/usr/local/bin/ash-consumer /etc/ash/consumer.conf
@@ -13,7 +25,12 @@ RestartSec=10
 StartLimitBurst=3
 StartLimitIntervalSec=120
 
-Environment=PYTHONPATH=/usr/local/lib/python3/dist-packages
+# Shared modules (ash_observability/ash_alerting) live in lib/ash; the
+# dist-packages entry supports distro-installed psycopg2/kafka packages.
+Environment=PYTHONPATH=/usr/local/lib/ash:/usr/local/lib/python3/dist-packages
+Environment=ASH_LOG_LEVEL=INFO
+# Loopback-only by default; Prometheus on the same host can scrape it.
+Environment=ASH_METRICS_HOST=127.0.0.1
 
 # Security hardening
 ProtectSystem=strict

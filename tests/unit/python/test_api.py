@@ -1,6 +1,10 @@
 """Unit tests for the REST API's health and authentication behavior."""
 
+import logging
+import uuid
+
 import jwt
+import pytest
 
 
 class _HealthyConnection:
@@ -17,6 +21,149 @@ def test_health_is_healthy_when_the_database_connects(
 
     assert response.status_code == 200
     assert response.get_json() == {"status": "healthy", "database": "connected"}
+
+
+def test_liveness_is_independent_of_the_database(api_client):
+    response = api_client.get("/health/live")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "alive"}
+
+
+def test_readiness_reports_ready_when_the_database_connects(
+    api_client, api_module, monkeypatch
+):
+    monkeypatch.setattr(api_module, "get_db", lambda: _HealthyConnection())
+
+    response = api_client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "status": "ready",
+        "checks": {"database": "connected"},
+    }
+    assert api_module.API_DATABASE_AVAILABLE._value.get() == 1
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("1", True),
+        ("TRUE", True),
+        ("yes", True),
+        ("on", True),
+        ("0", False),
+        ("FALSE", False),
+        ("no", False),
+        ("off", False),
+    ],
+)
+def test_env_flag_accepts_the_documented_boolean_domain(
+    api_module, monkeypatch, raw, expected
+):
+    monkeypatch.setenv("ASH_TEST_FLAG", raw)
+
+    assert api_module._env_flag("ASH_TEST_FLAG") is expected
+
+
+def test_env_flag_rejects_invalid_values(api_module, monkeypatch):
+    monkeypatch.setenv("ASH_TEST_FLAG", "ture")
+
+    with pytest.raises(RuntimeError, match="ASH_TEST_FLAG"):
+        api_module._env_flag("ASH_TEST_FLAG")
+
+
+def test_generated_request_id_is_returned(api_client):
+    response = api_client.get("/health/live")
+
+    request_id = response.headers["X-Request-ID"]
+    assert str(uuid.UUID(request_id)) == request_id
+
+
+def test_safe_client_request_id_is_preserved(api_client):
+    response = api_client.get(
+        "/health/live", headers={"X-Request-ID": "client-request-123"}
+    )
+
+    assert response.headers["X-Request-ID"] == "client-request-123"
+
+
+def test_unsafe_client_request_id_is_replaced(api_client):
+    # Werkzeug itself rejects a newline before the app sees it, so use a
+    # value it accepts but the ASH sanitizer rejects (spaces/semicolon).
+    unsafe = "bad id;with spaces"
+    response = api_client.get("/health/live", headers={"X-Request-ID": unsafe})
+
+    request_id = response.headers["X-Request-ID"]
+    assert request_id != unsafe
+    assert str(uuid.UUID(request_id)) == request_id
+
+
+def test_access_log_omits_query_string_and_authorization(api_client, api_module):
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = Capture()
+    api_module.logger.addHandler(handler)
+    previous_level = api_module.logger.level
+    api_module.logger.setLevel(logging.INFO)
+    try:
+        response = api_client.get(
+            "/api/v1/events?command=SEARCH_SECRET",
+            headers={"Authorization": "Bearer TOKEN_SECRET"},
+        )
+    finally:
+        api_module.logger.removeHandler(handler)
+        api_module.logger.setLevel(previous_level)
+
+    assert response.status_code == 401
+    access = [r for r in records if r.getMessage() == "request completed"]
+    assert access
+    record = access[-1]
+    assert record.path == "/api/v1/events"
+    assert record.method == "GET"
+    assert record.status_code == 401
+    assert record.request_id
+    assert "SEARCH_SECRET" not in str(record.__dict__)
+    assert "TOKEN_SECRET" not in str(record.__dict__)
+    assert "Authorization" not in record.__dict__
+
+
+def test_metrics_are_disabled_by_default(api_client, monkeypatch):
+    monkeypatch.delenv("ASH_METRICS_ENABLED", raising=False)
+
+    response = api_client.get("/metrics")
+
+    assert response.status_code == 404
+
+
+def test_metrics_fail_closed_without_a_token(api_client, monkeypatch):
+    monkeypatch.setenv("ASH_METRICS_ENABLED", "true")
+    monkeypatch.delenv("ASH_METRICS_TOKEN", raising=False)
+
+    response = api_client.get("/metrics")
+
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"].startswith("Bearer")
+
+
+def test_metrics_require_the_configured_token(api_client, monkeypatch):
+    monkeypatch.setenv("ASH_METRICS_ENABLED", "true")
+    monkeypatch.setenv("ASH_METRICS_TOKEN", "metrics-secret")
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+
+    unauthorized = api_client.get("/metrics")
+    authorized = api_client.get(
+        "/metrics", headers={"Authorization": "Bearer metrics-secret"}
+    )
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert authorized.content_type.startswith("text/plain")
+    assert b"ash_api_requests_total" in authorized.data
 
 
 def test_admin_credentials_return_a_usable_token(api_client):

@@ -9,9 +9,12 @@ import logging
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+
+from ash_observability import log_extra, safe_url_for_log, utc_timestamp
 
 logger = logging.getLogger("ash-alerting")
 
@@ -57,10 +60,20 @@ class AlertRule:
 class ASHAlertEngine:
     """Alert engine that evaluates events against detection rules."""
 
-    def __init__(self, config_path: str = "/etc/ash/alert_rules.json"):
+    def __init__(
+        self,
+        config_path: str = "/etc/ash/alert_rules.json",
+        alert_log_path: Optional[str] = None,
+    ):
         self.rules = self._load_rules(config_path)
         self.webhooks = self._load_webhooks(config_path)
-        self.alert_log_path = "/var/log/ash/alerts.jsonl"
+        # Domain: a writable file path.  The consumer passes its own log_dir
+        # so tests and non-default deployments do not write to /var/log/ash.
+        self.alert_log_path = (
+            alert_log_path
+            or os.environ.get("ASH_ALERT_LOG")
+            or "/var/log/ash/alerts.jsonl"
+        )
 
     def _load_rules(self, config_path: str) -> List[AlertRule]:
         default_rules = [
@@ -281,15 +294,50 @@ class ASHAlertEngine:
         }
 
         for webhook_url in self.webhooks:
+            # Slack/Discord webhook URLs carry the credential in the path.
+            # Keep only scheme+host in both success and failure logs.
+            webhook_host = safe_url_for_log(webhook_url)
             try:
-                requests.post(webhook_url, json=message, timeout=5)
+                response = requests.post(webhook_url, json=message, timeout=5)
+                if response.ok:
+                    logger.debug(
+                        "Webhook delivered",
+                        extra=log_extra(
+                            webhook_host=webhook_host,
+                            status_code=response.status_code,
+                        ),
+                    )
+                else:
+                    logger.warning(
+                        "Webhook endpoint rejected the alert",
+                        extra=log_extra(
+                            webhook_host=webhook_host,
+                            status_code=response.status_code,
+                        ),
+                    )
+            except requests.RequestException as e:
+                # Requests exceptions include the full URL in their string
+                # form, so log only the exception type and the redacted host.
+                logger.error(
+                    "Webhook delivery failed",
+                    extra=log_extra(
+                        webhook_host=webhook_host,
+                        error_type=type(e).__name__,
+                    ),
+                )
             except Exception as e:
-                logger.error(f"Webhook delivery failed ({webhook_url}): {e}")
+                logger.error(
+                    "Unexpected webhook error",
+                    extra=log_extra(
+                        webhook_host=webhook_host,
+                        error_type=type(e).__name__,
+                    ),
+                )
 
     def _log_alert(self, rule: AlertRule, event: Dict):
         """Write alert to structured log file."""
         alert_record = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": utc_timestamp(),
             "rule_name": rule.name,
             "severity": rule.severity,
             "description": rule.description,
@@ -303,7 +351,15 @@ class ASHAlertEngine:
             "trigger_count": rule.trigger_count,
         }
         try:
-            with open(self.alert_log_path, "a", encoding="utf-8") as f:
+            log_path = Path(self.alert_log_path)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(alert_record) + "\n")
         except Exception as e:
-            logger.error(f"Alert log write failed: {e}")
+            # Keep the alert path from breaking event processing for any
+            # write/serialization failure; log only the exception type so a
+            # path or value cannot leak into the central log.
+            logger.error(
+                "Alert log write failed",
+                extra=log_extra(error_type=type(e).__name__),
+            )

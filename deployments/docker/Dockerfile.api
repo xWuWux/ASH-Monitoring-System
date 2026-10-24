@@ -1,8 +1,14 @@
 FROM python:3.12-slim
 
+ENV PYTHONUNBUFFERED=1
+
+# Multi-process Prometheus metrics: each gunicorn worker writes its counters
+# here, and gunicorn.conf.py removes stale files at master start / worker exit.
+ENV PROMETHEUS_MULTIPROC_DIR=/tmp/ash-prometheus
+
 RUN useradd -r -u 1000 -s /bin/false ash && \
-    mkdir -p /var/log/ash && \
-    chown ash:ash /var/log/ash
+    mkdir -p /var/log/ash /tmp/ash-prometheus && \
+    chown ash:ash /var/log/ash /tmp/ash-prometheus
 
 COPY src/consumer/requirements.txt /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements.txt && \
@@ -13,4 +19,4 @@ COPY src/consumer/ /usr/local/lib/ash/
 USER ash
 EXPOSE 8080
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "4", "--timeout", "120", "api_server:app", "--chdir", "/usr/local/lib/ash"]
+CMD ["gunicorn", "--config", "/usr/local/lib/ash/gunicorn.conf.py", "--bind", "0.0.0.0:8080", "--workers", "4", "--timeout", "120", "api_server:app", "--chdir", "/usr/local/lib/ash"]

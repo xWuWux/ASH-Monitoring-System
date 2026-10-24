@@ -18,6 +18,7 @@ setup() {
     export INOTIFY_ENABLED=false
     export MAX_COMMANDS_PER_SECOND=50
     export MAX_OUTPUT_SIZE=1048576
+    export ASH_WATCHDOG_INTERVAL=10
 }
 
 teardown() {
@@ -92,4 +93,11 @@ run_validate_config() {
     run_validate_config
     [[ $status -ne 0 ]]
     [[ "$output" == *"MAX_OUTPUT_SIZE"* ]]
+}
+
+@test "validate_config rejects a non-positive ASH_WATCHDOG_INTERVAL" {
+    export ASH_WATCHDOG_INTERVAL=0
+    run_validate_config
+    [[ $status -ne 0 ]]
+    [[ "$output" == *"ASH_WATCHDOG_INTERVAL"* ]]
 }

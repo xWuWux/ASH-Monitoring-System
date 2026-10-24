@@ -75,7 +75,7 @@ safer**:
 | 23 | Consumer main loop | Unexpected exception | `run()` logs and re-raises; the offset is not committed | On-failure supervisors restart it; the failure is visible | **Fixed**; consume-loop test |
 | 24 | Consumer retention | `VACUUM` after `DELETE` | `VACUUM` ran inside a transaction and failed every time | Table bloat; cleanup logged as successful | **Fixed**; autocommit around VACUUM + unit test |
 | 25 | Consumer retention | Archive/delete cutoffs | Archive re-reads and appends the same old rows each day; `datetime.now()` is local time | Duplicate archive growth; timezone skew | **Open.** Record archive watermarks; use naive UTC |
-| 26 | Consumer metrics | Metrics port fails | Logs a warning and continues | Docker health check hits the metrics port; an unhealthy process can look healthy | **Open.** Fail startup or expose a real health endpoint |
+| 26 | Consumer metrics | Metrics port fails | Logs an error and continues processing; the listener cannot bind | Docker now probes `/health/ready`, so a missing listener is unhealthy instead of "port open, process wedged" | **Fixed.** Combined metrics/health listener; bind failure is visible and data processing is not aborted |
 | 27 | API startup | Missing secrets/env | Refuses to start with a clear `RuntimeError` | Good | Acceptable |
 | 28 | API auth | Credential comparison | `hmac.compare_digest`; JWT with expiry | Good | Acceptable; add revocation/refresh only if needed |
 | 29 | API input | Invalid int/UUID/timestamp | Returns JSON 400 before SQL | Good | Acceptable; cap free-text filter lengths |
@@ -84,7 +84,7 @@ safer**:
 | 32 | API integrity | Content tampering | Only `prev_hash` links are checked; `raw_event` JSONB cannot reproduce the signed bytes. `command_logs.raw_event_text` now stores the exact signed line, and the Kafka E2E recomputes the hash from it | An attacker with DB write access can still rewrite content and recompute links; API verification still says PASS until it recomputes from `raw_event_text` | **Partially fixed — approved deferral.** Raw text is stored (done); recompute `sha256(prev_hash || event_json)` in the API next |
 | 33 | API performance | One PostgreSQL connection per request | New TCP/auth/backend per API call; p95 is sensitive to DB latency | Throughput ceiling, connection storms | **Open.** Add a per-worker connection pool |
 | 34 | API rate limit | In-memory limiter under 4 gunicorn workers | Effective limit is roughly 4× configured | Brute-force budget is larger than documented | Documented limitation; use Redis if exact |
-| 35 | Deployment | Consumer liveness | Docker health check only proves the metrics HTTP port is open | Kafka/DB stalled but container “healthy” | **Open.** Health should reflect consumer lag/last successful flush |
+| 35 | Deployment | Consumer liveness | Docker and systemd previously had no readiness signal; only the metrics port was probed | Kafka/DB stalled but container “healthy” | **Fixed.** `/health/live` vs `/health/ready` (DB + pending flush); Docker probes readiness; consumer sends systemd `READY=1`/`WATCHDOG=1`; Kafka E2E asserts readiness, metrics, and JSON logs |
 | 36 | CI | Real integration | New `kafka-e2e` job uses real Kafka/Zookeeper/PostgreSQL, the real agent producer, and the real consumer | The startup bug above was invisible to mocked tests and is now caught | **Added**; kept blocking in `ci-success` |
 
 ## What this PR fixes (and the tests that lock it in)
@@ -148,10 +148,31 @@ Secondary questions:
 
 ## New variables and functions
 
-No production environment variables were added.
+The observability PR adds the production variables below. Their full
+definitions, precedence rules, and security notes are in
+`docs/OBSERVABILITY.md`; the consumer/API tables there are authoritative.
 
 | Name | Domain / values | Default | Purpose |
 |------|-----------------|---------|---------|
+| `ASH_KAFKA_BROKERS` | comma-separated `host:port` list, at least one | JSON/default | Docker/Compose Kafka bootstrap servers |
+| `ASH_KAFKA_TOPIC` | non-empty topic string | JSON/default | Consumer topic |
+| `ASH_KAFKA_GROUP_ID` | non-empty group string | JSON/default | Consumer group |
+| `ASH_DATABASE_URL` | non-empty PostgreSQL URL | JSON/default | Database connection |
+| `ASH_DATABASE_ENABLED` | `1/true/yes/on` or `0/false/no/off` | JSON/default | Whether PostgreSQL is authoritative |
+| `ASH_ALERTING_ENABLED` | boolean domain above | JSON/default | Enable alert engine |
+| `ASH_LOG_DIR` | non-empty writable path | `/var/log/ash` | JSON file log directory (consumer); optional API per-worker file |
+| `ASH_LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | `INFO` | Consumer/API root log level |
+| `ASH_LOG_MAX_BYTES` | integer ≥ 0 | `10485760` | Rotation threshold; 0 disables |
+| `ASH_LOG_BACKUP_COUNT` | integer ≥ 0 | `5` | Retained rotated files |
+| `ASH_METRICS_HOST` | hostname or IP | `127.0.0.1` | Consumer health/metrics bind address |
+| `ASH_METRICS_PORT` | integer 1-65535 | `9090` | Consumer health/metrics port |
+| `ASH_BATCH_SIZE` | integer ≥ 1 | `100` | Events per batch |
+| `ASH_BATCH_TIMEOUT` | finite number ≥ 0.001 | `5.0` | Partial-batch timeout seconds |
+| `ASH_ALERT_LOG` | writable file path; unset/empty uses default | `/var/log/ash/alerts.jsonl` | Alert JSONL destination when no explicit path is passed |
+| `ASH_METRICS_ENABLED` | `1/true/yes/on` or unset/false | `false` | API `/metrics` served instead of 404 |
+| `ASH_METRICS_TOKEN` | non-empty secret; empty fails closed | empty | Bearer token for API `/metrics` |
+| `PROMETHEUS_MULTIPROC_DIR` | writable directory path | unset / image default | Aggregate API metrics across gunicorn workers |
+| `ASH_WATCHDOG_INTERVAL` | integer seconds ≥ 1 | `10` | Agent systemd watchdog heartbeat interval |
 | `ASH_KAFKA_BROKER` (E2E) | `host:port` | `127.0.0.1:9092` | Broker used by the E2E test |
 | `ASH_KAFKA_TOPIC` (E2E) | Kafka topic string | `ash-e2e-<epoch>-<pid>` | Unique topic per run |
 | `ASH_KAFKA_GROUP` (E2E) | Kafka group string | `ash-e2e-group-<epoch>-<pid>` | Unique group per run |
@@ -171,8 +192,37 @@ No production environment variables were added.
 | `_insert_database_rows(cursor, events, raw_texts)` (consumer) | cursor + parallel lists | — | Shared command/file/session insert path |
 | `_append_dead_letter_record(record)` (consumer) | `bool` | — | Shared DLQ JSONL append; reports failure |
 | `_write_dead_letter_raw(raw_text, reason)` (consumer) | `bool` | — | DLQ for payloads that are not valid JSON objects |
-| `_update_lag()` (consumer) | none; updates `KAFKA_LAG` | — | Publishes Kafka max lag for outage visibility |
-| `DB_AVAILABLE` (metric) | gauge, `0` or `1` | `1` after a successful write | Database health signal |
+| `_update_lag()` (consumer) | none; updates lag/assignment gauges | — | Publishes Kafka position lag and assignment; explicitly not committed-offset lag |
+| `_apply_environment(config)` (consumer) | mutates a config dict; raises `ValueError` on invalid values | — | Applies and validates `ASH_*` overrides |
+| `_env_bool`, `_env_int`, `_env_float`, `_env_string` (consumer) | see `docs/OBSERVABILITY.md` domains | — | Typed environment parsing with fail-fast errors |
+| `_ensure_shared_module_path(lib_dir)` (consumer) | absolute directory path; missing paths are ignored | `/usr/local/lib/ash` | Lets the installed `bin/ash-consumer` import shared modules from `lib/ash`; no-op in source/container layouts |
+| `_is_ready()` (consumer) | `bool`; requires running, no pending flush error, and DB available when enabled | — | Single readiness decision used by the gauge and endpoint |
+| `_refresh_readiness()` (consumer) | updates `ash_consumer_ready` | — | Keeps the gauge aligned with `/health/ready` |
+| `health_liveness()` (consumer) | returns `(HTTPStatus, dict)`; 200 while running, 503 while stopping | — | Process-only liveness |
+| `health_readiness()` (consumer) | returns `(HTTPStatus, dict)`; 200 only when running, flush has no pending error, and DB (if enabled) is available | — | Secret-free readiness body |
+| `_ObservabilityHandler` (consumer) | `GET` on `/metrics`, `/health/live`, `/health/ready`, `/health`; other paths 404 | — | One listener for metrics and health; request lines are not logged |
+| `_start_observability_server()` (consumer) | host/IP + TCP port from config | — | Serves `/metrics`, `/health/live`, `/health/ready`, `/health` |
+| `_start_watchdog()` (consumer) | no-op without `NOTIFY_SOCKET`; sends every 10s | — | systemd liveness without tying it to Kafka traffic |
+| `utc_timestamp()` (observability) | no input; ISO-8601 UTC string with milliseconds and `Z` | — | Consistent timestamps for JSON logs and alert records |
+| `new_request_id()` (observability) | no input; 36-character lowercase UUID | — | Request ID when the client did not send a safe one |
+| `configure_logging(component, level, log_dir, ...)` (observability) | component string; level allow-list; directory or `None`; max bytes/backups ≥ 0 | — | JSON stdout plus optional bounded rotating file; idempotent |
+| `JsonFormatter(component)` (observability) | LogRecord -> one JSON object using the allow-list | — | Stable schema; no arbitrary record attributes |
+| `log_extra(**values)` (observability) | keys from `LOG_EXTRA_FIELDS` only; unknown keys dropped | — | Prevents reserved/arbitrary logging keys and unstable fields |
+| `safe_url_for_log(url)` (observability) | URL string -> `scheme://host[:port]` or `<invalid-url>` | — | Removes webhook path/query/userinfo |
+| `redact_text(value)` (observability) | any value -> string with URL userinfo and `password=`/`token:`-style assignments replaced by `[redacted]` | — | Safety net for exception text; host/port/path remain |
+| `sanitize_request_id(value)` (observability) | 1-128 chars from `[A-Za-z0-9._:-]` or `None` | — | Prevents header/log injection |
+| `sd_notify(message)` (observability) | `READY=1`, `WATCHDOG=1`, `STOPPING=1`, etc.; no-op without `NOTIFY_SOCKET` | — | Minimal systemd notification client |
+| `_start_request_observation()` (API) | inbound `X-Request-ID` sanitized or replaced; starts timer and in-flight gauge | — | Correlation and bounded request measurements |
+| `_finish_request_observation(error)` (API) | decrements the in-flight gauge once | — | Prevents gauge drift on errors |
+| `_log_request(response)` (API) | Flask response; logs bounded route/method/status/duration and `X-Request-ID` | — | Access log without query string, headers, or body |
+| `_database_available()` (API) | `bool`; opens and closes one PostgreSQL connection | — | Shared readiness decision; failure text is not logged or returned |
+| `health_live()`, `health_ready()` (API) | GET; 200/503 as described in `docs/OBSERVABILITY.md` | — | Split liveness from DB readiness |
+| `_metrics_enabled()`, `_metrics_token()`, `_metrics_authorized()` (API) | enabled: `1/true/yes/on` or unset/false; token: non-empty secret; auth: exact `Bearer <token>` | disabled/empty | Fail-closed gate for `/metrics` |
+| `metrics()` (API) | GET; 404 disabled, 401 unauthenticated, 200 with bearer token | — | Opt-in Prometheus endpoint |
+| `on_starting`, `child_exit` (gunicorn) | no-op without `PROMETHEUS_MULTIPROC_DIR` | — | Clear stale mmaps and mark dead workers |
+| `watchdog_kick()`, `start_watchdog()` (agent) | no-op without `NOTIFY_SOCKET`; interval ≥ 1s | — | Heartbeat independent of command traffic |
+| `DB_AVAILABLE` (metric) | gauge, `0` or `1` | `1` after a successful write | Consumer database health signal |
+| `API_DATABASE_AVAILABLE` (metric) | gauge, `0` or `1`, `multiprocess_mode=max` | `0` until a readiness check succeeds | API database health signal |
 | `_processing_lock` (consumer) | `threading.Lock` | — | Serializes message processing/commit against the flush timer |
 | `batch_raw_texts` (consumer) | list parallel to `batch_buffer`; `str` or `None` | `[]` | Raw text retained with buffered events |
 | `MAX_TEXT_LENGTH` (consumer) | `1_048_576` | — | Maximum `TEXT` field length accepted |

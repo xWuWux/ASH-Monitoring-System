@@ -7,9 +7,30 @@ Wants=postgresql.service
 Type=simple
 User=ash
 Group=ash
-ExecStart=/usr/bin/python3 /usr/local/lib/ash/api_server.py
+# Gunicorn, not Flask's development server: four sync workers, the same
+# process model as the container image. The metrics mmap directory is a
+# runtime directory so ProtectSystem=strict does not block writes and the
+# contents disappear on stop/start.
+ExecStart=/usr/bin/env gunicorn \
+    --config /usr/local/lib/ash/gunicorn.conf.py \
+    --bind 127.0.0.1:${ASH_API_PORT} \
+    --workers 4 \
+    --timeout 120 \
+    --chdir /usr/local/lib/ash \
+    api_server:app
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=30
 Restart=always
 RestartSec=5
+
+RuntimeDirectory=ash-prometheus
+RuntimeDirectoryMode=0750
+Environment=PROMETHEUS_MULTIPROC_DIR=/run/ash-prometheus
+Environment=ASH_LOG_LEVEL=INFO
+# Metrics stay off until the monitoring stack is configured and
+# ASH_METRICS_TOKEN is added to /etc/ash/api.env.
+Environment=ASH_METRICS_ENABLED=false
 
 # Placeholder default; override by adding ASH_DATABASE_URL to
 # /etc/ash/api.env once Postgres is provisioned (install.sh cannot

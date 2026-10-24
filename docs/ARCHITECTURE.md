@@ -52,7 +52,8 @@
 │  │  • Event deduplication (UUID-based)                       │   │
 │  │  • Schema validation                                      │   │
 │  │  • Retry logic with exponential backoff                   │   │
-│  │  • Prometheus metrics (:9090)                             │   │
+│  │  • JSON logs + event correlation (event_id/session_id)    │   │
+│  │  • Metrics, liveness, readiness (:9090)                   │   │
 │  │  • Retention management (archive + delete)                │   │
 │  └───────┬─────────────────┬──────────────────┬─────────────┘   │
 │          │                 │                  │                  │
@@ -93,6 +94,26 @@
 | 2. Kernel | auditd execve rules | ALL process execution | Hard (requires root) |
 | 3. Filesystem | inotify watches | File modifications | Medium (inotify limits) |
 | 4. Container | Docker event stream | Container lifecycle | Medium |
+
+## Observability
+
+The consumer and API emit one JSON object per application log record to
+stdout; the consumer also writes a bounded rotating file. Event-related
+consumer lines carry `event_id`/`session_id`, and API responses carry
+`X-Request-ID`.
+
+Health is split into liveness and readiness. Consumer readiness requires a
+successful storage path (PostgreSQL when enabled, local JSONL always) and no
+flush left pending. API readiness requires a PostgreSQL connection. Docker
+probes readiness; the consumer's systemd unit uses `Type=notify` and a
+watchdog. The consumer's Kafka lag gauge is explicitly position-based, not
+committed-offset lag, so alerts should also use the last-successful-flush
+timestamp.
+
+Agent logs stay local and append-only; agent events reach the central server
+through Kafka. See `docs/OBSERVABILITY.md` for the schema, metrics,
+environment-variable domains, and security rules. Distributed tracing and the
+monitoring stack are later PRs.
 
 ## Event Schema (v1.0)
 

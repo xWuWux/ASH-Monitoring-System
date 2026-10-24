@@ -5,18 +5,82 @@ Provides JWT-based authentication and RBAC.
 """
 
 import hmac
+import logging
 import os
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from typing import Optional
 
 import jwt
 import psycopg2
-from flask import Flask, jsonify, request
+from flask import Flask, Response, g, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+    multiprocess,
+)
 from psycopg2.extras import RealDictCursor
 from werkzeug.exceptions import BadRequest
+
+from ash_observability import (
+    FALSE_VALUES,
+    LOG_LEVELS,
+    TRUE_VALUES,
+    configure_logging,
+    log_extra,
+    new_request_id,
+    sanitize_request_id,
+)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a strict boolean environment variable.
+
+    Domain: unset -> ``default``; otherwise one of ``1/true/yes/on`` or
+    ``0/false/no/off`` (case-insensitive).  Any other value raises
+    ``RuntimeError`` naming the variable, so a typo cannot silently disable
+    metrics or change another safety-relevant flag.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in TRUE_VALUES:
+        return True
+    if value in FALSE_VALUES:
+        return False
+    raise RuntimeError(
+        f"{name} must be one of {TRUE_VALUES + FALSE_VALUES}, got {raw!r}"
+    )
+
+
+_LOG_LEVEL = os.environ.get("ASH_LOG_LEVEL", "INFO").strip().upper()
+if _LOG_LEVEL not in LOG_LEVELS:
+    raise RuntimeError(f"ASH_LOG_LEVEL must be one of {LOG_LEVELS}, got {_LOG_LEVEL!r}")
+
+# The API's file log is per gunicorn worker: rotating one shared file from
+# four processes is not safe (one worker can rotate the file another still
+# has open).  Operators get JSON on stdout by default; setting ASH_LOG_DIR
+# additionally writes bounded api-<pid>.log files.
+_ash_log_dir = os.environ.get("ASH_LOG_DIR") or None
+logger = configure_logging(
+    "ash-api",
+    level=_LOG_LEVEL,
+    log_dir=_ash_log_dir,
+    log_name=f"api-{os.getpid()}.log",
+)
+
+# Validate the metrics flag at import so a typo prevents startup instead of
+# silently leaving the endpoint disabled.
+_env_flag("ASH_METRICS_ENABLED", False)
 
 
 def _require_env(name: str) -> str:
@@ -37,6 +101,74 @@ app = Flask(__name__)
 app.config["JWT_SECRET"] = _require_env("ASH_JWT_SECRET")
 app.config["JWT_EXPIRY_HOURS"] = int(os.environ.get("ASH_JWT_EXPIRY_HOURS", "24"))
 DATABASE_URL = _require_env("ASH_DATABASE_URL")
+
+# ─── API Metrics ─────────────────────────────────────────────────────────────
+# route is the Flask rule (for example "/api/v1/events/<event_id>"), not the
+# raw path, so an event UUID cannot create unbounded label cardinality.
+API_REQUESTS = Counter(
+    "ash_api_requests_total",
+    "Total HTTP requests handled by the ASH API",
+    ["method", "route", "status"],
+)
+API_REQUEST_DURATION = Histogram(
+    "ash_api_request_duration_seconds",
+    "ASH API request duration",
+    ["method", "route"],
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+)
+API_INFLIGHT = Gauge(
+    "ash_api_inflight_requests",
+    "HTTP requests currently being handled by this API process",
+    multiprocess_mode="livesum",
+)
+API_DATABASE_AVAILABLE = Gauge(
+    "ash_api_database_available",
+    "1 when the last readiness check opened a PostgreSQL connection, 0 otherwise",
+    multiprocess_mode="max",
+)
+
+# In gunicorn with multiple workers, prometheus_client must aggregate the
+# per-worker mmap files.  The directory is created by the image/unit and is
+# only used when explicitly configured; single-process runs use the default
+# registry.  See src/consumer/gunicorn.conf.py for worker cleanup.
+if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+    os.makedirs(os.environ["PROMETHEUS_MULTIPROC_DIR"], exist_ok=True)
+
+
+def _metrics_enabled() -> bool:
+    """Return whether ``/metrics`` is served.
+
+    Domain: ``ASH_METRICS_ENABLED`` is unset/false (default, endpoint
+    returns 404) or one of ``1/true/yes/on``.  Disabled by default because
+    the API port is commonly published to users.
+    """
+    return _env_flag("ASH_METRICS_ENABLED", False)
+
+
+def _metrics_token() -> str:
+    """Return the bearer token required for ``/metrics``, or ``""``.
+
+    Domain: ``ASH_METRICS_TOKEN`` must be a non-empty secret when metrics
+    are enabled.  An empty value makes every metrics request fail closed
+    rather than exposing process data unauthenticated.
+    """
+    return os.environ.get("ASH_METRICS_TOKEN", "")
+
+
+def _metrics_authorized() -> bool:
+    """Compare the request's bearer token in constant time."""
+    token = _metrics_token()
+    if not token:
+        return False
+    supplied = request.headers.get("Authorization", "")
+    return hmac.compare_digest(supplied, f"Bearer {token}")
+
+
+if _metrics_enabled() and not _metrics_token():
+    logger.error(
+        "ASH_METRICS_ENABLED is true but ASH_METRICS_TOKEN is empty; "
+        "/metrics will reject every request"
+    )
 
 # In-memory storage: correct for a single process, but under gunicorn's
 # multiple sync workers (see Dockerfile.api's --workers 4) each worker
@@ -80,6 +212,93 @@ def get_db():
     return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
 
+# ─── Request Correlation and Access Logging ─────────────────────────────────
+_HEALTH_ROUTES = ("/health", "/health/live", "/health/ready")
+
+
+@app.before_request
+def _start_request_observation():
+    """Assign a request ID and start the duration/in-flight measurements.
+
+    Domain: an inbound ``X-Request-ID`` is accepted only if it matches
+    1-128 characters from ``[A-Za-z0-9._:-]``; otherwise a new UUID replaces
+    it.  This prevents log/header injection and keeps IDs bounded.
+    """
+    g.request_id = (
+        sanitize_request_id(request.headers.get("X-Request-ID")) or new_request_id()
+    )
+    g.request_started = time.monotonic()
+    g.inflight_counted = True
+    API_INFLIGHT.inc()
+
+
+@app.teardown_request
+def _finish_request_observation(_error):
+    """Release the in-flight gauge exactly once per request."""
+    if getattr(g, "inflight_counted", False):
+        API_INFLIGHT.dec()
+        g.inflight_counted = False
+
+
+@app.after_request
+def _log_request(response):
+    """Emit one structured access log and the request metrics.
+
+    The query string, headers, and body are deliberately absent: a search
+    query or authorization header can contain credentials or sensitive
+    command text.  ``request.path`` plus the matched route is enough to
+    operate the service.
+    """
+    request_id = getattr(g, "request_id", None) or new_request_id()
+    response.headers["X-Request-ID"] = request_id
+
+    started = getattr(g, "request_started", None)
+    duration = max(0.0, time.monotonic() - started) if started else 0.0
+    route = request.url_rule.rule if request.url_rule is not None else "unmatched"
+
+    try:
+        API_REQUESTS.labels(
+            method=request.method,
+            route=route,
+            status=str(response.status_code),
+        ).inc()
+        API_REQUEST_DURATION.labels(
+            method=request.method,
+            route=route,
+        ).observe(duration)
+    except Exception:
+        # Metrics must never turn a successful API response into a 500.
+        pass
+
+    try:
+        if route in _HEALTH_ROUTES:
+            level = logging.DEBUG
+        elif response.status_code >= 500:
+            level = logging.ERROR
+        elif response.status_code >= 400:
+            level = logging.WARNING
+        else:
+            level = logging.INFO
+        logger.log(
+            level,
+            "request completed",
+            extra=log_extra(
+                request_id=request_id,
+                method=request.method,
+                path=request.path,
+                route=route,
+                status_code=response.status_code,
+                duration_ms=round(duration * 1000, 3),
+                remote_addr=request.remote_addr,
+            ),
+        )
+    except Exception:
+        # Same rule as metrics: observability must not break the response.
+        pass
+
+    return response
+
+
 @app.errorhandler(429)
 def rate_limit_exceeded(_e):
     return jsonify({"error": "Too many requests, try again later"}), 429
@@ -96,15 +315,22 @@ def invalid_request(error):
 def database_unavailable(error):
     # Connection loss is an expected runtime condition, not a bug. Without
     # this handler Flask returned its default HTML 500 page, which breaks
-    # JSON clients and hides the retryable nature of the failure. Log the
-    # detail server-side; never echo connection strings to the caller.
-    app.logger.error("Database unavailable: %s", error)
+    # JSON clients and hides the retryable nature of the failure. Log only
+    # the exception type: psycopg2's message can include the server address
+    # and username, and neither belongs in a central log by default.
+    logger.error(
+        "Database unavailable",
+        extra=log_extra(error_type=type(error).__name__),
+    )
     return jsonify({"error": "database unavailable"}), 503
 
 
 @app.errorhandler(psycopg2.Error)
 def database_error(error):
-    app.logger.error("Database error: %s", error)
+    logger.error(
+        "Database error",
+        extra=log_extra(error_type=type(error).__name__),
+    )
     return jsonify({"error": "database error"}), 500
 
 
@@ -574,20 +800,112 @@ def verify_integrity():
     )
 
 
-# ─── Health Endpoint ─────────────────────────────────────────────────────────
-@app.route("/health", methods=["GET"])
-def health():
-    """Health check endpoint."""
-    checks = {"status": "healthy"}
+# ─── Health and Metrics Endpoints ───────────────────────────────────────────
+_last_database_health: Optional[bool] = None
+
+
+def _database_available() -> bool:
+    """Return whether a PostgreSQL connection can be opened.
+
+    The exception text is intentionally not returned to the caller or put in
+    the access log.  It can contain the database host, user, and (for some
+    drivers) connection parameters.  Log only state transitions: Docker
+    probes readiness every 10 seconds, and repeating the same failure line
+    would bury the first occurrence.
+    """
+    global _last_database_health
     try:
         conn = get_db()
         conn.close()
-        checks["database"] = "connected"
-    except Exception:
-        checks["database"] = "disconnected"
-        checks["status"] = "degraded"
+    except Exception as error:
+        API_DATABASE_AVAILABLE.set(0)
+        if _last_database_health is not False:
+            logger.warning(
+                "Database health check failed",
+                extra=log_extra(error_type=type(error).__name__),
+            )
+        _last_database_health = False
+        return False
 
-    return jsonify(checks), 200 if checks["status"] == "healthy" else 503
+    API_DATABASE_AVAILABLE.set(1)
+    if _last_database_health is False:
+        logger.info("Database health check recovered")
+    _last_database_health = True
+    return True
+
+
+@app.route("/health/live", methods=["GET"])
+def health_live():
+    """Liveness: the API process can answer HTTP.
+
+    Domain: always HTTP 200 while the process is running.  Do not use this
+    for traffic routing; a process with a dead database is still live.
+    """
+    return jsonify({"status": "alive"}), 200
+
+
+@app.route("/health/ready", methods=["GET"])
+def health_ready():
+    """Readiness: the API can serve requests that need PostgreSQL.
+
+    Domain: HTTP 200 and ``status=ready`` when the database connection
+    succeeds; HTTP 503 and ``status=degraded`` otherwise.
+    """
+    database = _database_available()
+    status = "ready" if database else "degraded"
+    return (
+        jsonify(
+            {
+                "status": status,
+                "checks": {
+                    "database": "connected" if database else "disconnected",
+                },
+            }
+        ),
+        200 if database else 503,
+    )
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Legacy health endpoint; same readiness decision as /health/ready.
+
+    The response body is kept byte-for-byte compatible with the existing
+    contract: ``{"status": "healthy", "database": "connected"}``.
+    """
+    database = _database_available()
+    checks = {
+        "status": "healthy" if database else "degraded",
+        "database": "connected" if database else "disconnected",
+    }
+    return jsonify(checks), 200 if database else 503
+
+
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    """Expose Prometheus metrics when explicitly enabled and authenticated.
+
+    Domain: ``ASH_METRICS_ENABLED`` false/unset -> 404.  When enabled,
+    ``ASH_METRICS_TOKEN`` is required as ``Authorization: Bearer <token>``;
+    a missing token fails closed with 401.  The API port is often published,
+    so this endpoint is not unauthenticated by default.
+    """
+    if not _metrics_enabled():
+        return jsonify({"error": "not found"}), 404
+
+    if not _metrics_authorized():
+        response = jsonify({"error": "Authentication required"})
+        response.status_code = 401
+        response.headers["WWW-Authenticate"] = 'Bearer realm="metrics"'
+        return response
+
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        payload = generate_latest(registry)
+    else:
+        payload = generate_latest()
+    return Response(payload, content_type=CONTENT_TYPE_LATEST)
 
 
 if __name__ == "__main__":

@@ -39,7 +39,12 @@ def test_constructor_creates_log_dir_before_configuring_logging(
     monkeypatch.setattr(
         consumer_module.ASHConsumer, "_start_retention_timer", lambda self: None
     )
-    monkeypatch.setattr(consumer_module, "start_http_server", lambda _port: None)
+    monkeypatch.setattr(
+        consumer_module.ASHConsumer, "_start_observability_server", lambda self: None
+    )
+    monkeypatch.setattr(
+        consumer_module.ASHConsumer, "_start_watchdog", lambda self: None
+    )
     monkeypatch.setattr(consumer_module.signal, "signal", lambda *_args: None)
 
     consumer = consumer_module.ASHConsumer(str(config_path))
