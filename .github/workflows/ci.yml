@@ -428,6 +428,101 @@ jobs:
           ASH_ADMIN_PASS: ci-contract-password
         run: pytest tests/contract -v
 
+  # ── 6d. Kafka End-to-End (real broker, agent producer, consumer, DB) ─────
+  kafka-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ash_logs
+          POSTGRES_USER: ash
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      zookeeper:
+        image: confluentinc/cp-zookeeper:7.5.0
+        env:
+          ZOOKEEPER_CLIENT_PORT: 2181
+          ZOOKEEPER_TICK_TIME: 2000
+        ports:
+          - 2181:2181
+      kafka:
+        image: confluentinc/cp-kafka:7.5.0
+        env:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          # listeners must include every advertised listener; otherwise the
+          # broker rejects the advertised name or never binds port 29092.
+          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "kafka-broker-api-versions --bootstrap-server localhost:9092"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Kafka CLI
+        uses: actions/cache@v4
+        with:
+          path: /tmp/kafka_2.13-3.7.0
+          key: kafka-cli-3.7.0
+
+      - name: Install Kafka CLI
+        run: |
+          if [[ ! -x /tmp/kafka_2.13-3.7.0/bin/kafka-console-producer.sh ]]; then
+            curl -fsSL -o /tmp/kafka_2.13-3.7.0.tgz \
+              https://archive.apache.org/dist/kafka/3.7.0/kafka_2.13-3.7.0.tgz
+            curl -fsSL -o /tmp/kafka_2.13-3.7.0.tgz.sha512 \
+              https://archive.apache.org/dist/kafka/3.7.0/kafka_2.13-3.7.0.tgz.sha512
+            # Apache publishes this as "kafka_2.13-3.7.0.tgz: HASH" with
+            # spaces every 8 hex digits and line continuations -- not the
+            # "HASH  filename" format `sha512sum -c` expects.
+            expected=$(tr -d ' \n' < /tmp/kafka_2.13-3.7.0.tgz.sha512 \
+              | cut -d: -f2 | tr 'A-F' 'a-f')
+            actual=$(sha512sum /tmp/kafka_2.13-3.7.0.tgz | awk '{print $1}')
+            if [[ "$expected" != "$actual" ]]; then
+              echo "Kafka archive checksum mismatch" >&2
+              exit 1
+            fi
+            tar -xzf /tmp/kafka_2.13-3.7.0.tgz -C /tmp
+          fi
+          echo "/tmp/kafka_2.13-3.7.0/bin" >>"$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: pip install -r src/consumer/requirements.txt
+
+      - name: Run Kafka end-to-end test
+        env:
+          ASH_DATABASE_URL: postgresql://ash:test_password@localhost:5432/ash_logs
+          ASH_KAFKA_BROKER: 127.0.0.1:9092
+          ASH_KAFKA_TOPIC: ash-e2e-ci
+          ASH_KAFKA_GROUP: ash-e2e-ci-${{ github.run_id }}
+          ASH_E2E_TIMEOUT: "90"
+        run: bash tests/integration/kafka-e2e.sh
+
   # ── 7. Integration Tests & Migration Checks ──────────────────────────────
   integration-migration:
     runs-on: ubuntu-latest
@@ -548,6 +643,7 @@ jobs:
         smoke-tests,
         log-leak-test,
         contract-tests,
+        kafka-e2e,
         integration-migration,
         build-package,
       ]

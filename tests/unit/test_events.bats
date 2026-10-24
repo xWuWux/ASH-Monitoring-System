@@ -57,6 +57,35 @@ pending_count() {
     [[ $status -eq 0 ]]
 }
 
+@test "emit_event returns success for the first event" {
+    # The counter used to be incremented with ((EVENTS_LOGGED++)), whose
+    # status is the pre-increment value: the first event returned 1 after
+    # being written successfully (and killed set -e callers).
+    run emit_event "command_start" '{"command":"true"}'
+    [[ $status -eq 0 ]]
+    [[ $(wc -l <"$ASH_EVENTS_FILE") -eq 1 ]]
+}
+
+@test "safe_log_write reports failure when the target is not writable" {
+    # A directory makes the append fail even when the suite runs as root
+    # (which bypasses permission bits). The successful `rm` used to mask
+    # the failed `cat`, so the function returned success and dropped the
+    # event instead of taking its fallback path.
+    local target="$BATS_TEST_TMPDIR/not-a-file"
+    mkdir -p "$target"
+
+    run safe_log_write "should not disappear" "$target"
+    [[ $status -ne 0 ]]
+}
+
+@test "emit_event records a clean tty fallback without a terminal" {
+    emit_event "command_start" '{"command":"true"}'
+
+    run jq -r '.tty' "$ASH_EVENTS_FILE"
+    [[ $status -eq 0 ]]
+    [[ $output == "unknown" ]]
+}
+
 @test "emit_event preserves caller-supplied extra fields" {
     emit_event "command_start" '{"command":"cat /etc/hosts","bash_subshell":2,"lineno":42}'
 
@@ -171,6 +200,19 @@ SCRIPT
     run verify_hash_chain "$ASH_EVENTS_FILE"
     [[ $status -ne 0 ]]
     [[ $output == *"Hash mismatch"* ]]
+}
+
+@test "verify_hash_chain fails when the error count is a multiple of 256" {
+    # 128 entries with a wrong prev_hash and a wrong event_hash produce 256
+    # errors. Returning the raw count used to wrap to exit status 0.
+    for i in $(seq 1 128); do
+        printf '{"event_id":"bad-%s","prev_hash":"bad-%s","event_hash":"bad-%s"}\n' \
+            "$i" "$i" "$i"
+    done >"$ASH_EVENTS_FILE"
+
+    run verify_hash_chain "$ASH_EVENTS_FILE"
+    [[ $status -ne 0 ]]
+    [[ $output == *"FAIL: 256 integrity errors"* ]]
 }
 
 @test "verify_hash_chain detects a missing link in the chain" {
