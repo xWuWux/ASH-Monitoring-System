@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from ash_observability import log_extra, safe_url_for_log, utc_timestamp
+from ash_observability import log_extra, utc_timestamp
 
 logger = logging.getLogger("ash-alerting")
 
@@ -293,17 +293,19 @@ class ASHAlertEngine:
             ],
         }
 
-        for webhook_url in self.webhooks:
-            # Slack/Discord webhook URLs carry the credential in the path.
-            # Keep only scheme+host in both success and failure logs.
-            webhook_host = safe_url_for_log(webhook_url)
+        for webhook_index, webhook_url in enumerate(self.webhooks):
+            # Slack/Discord webhook URLs carry the credential in the path,
+            # and CodeQL correctly treats any value derived from the URL as
+            # sensitive.  Log its position in the configured list instead;
+            # an operator can map that index back without the URL reaching a
+            # central log.
             try:
                 response = requests.post(webhook_url, json=message, timeout=5)
                 if response.ok:
                     logger.debug(
                         "Webhook delivered",
                         extra=log_extra(
-                            webhook_host=webhook_host,
+                            webhook_index=webhook_index,
                             status_code=response.status_code,
                         ),
                     )
@@ -311,17 +313,17 @@ class ASHAlertEngine:
                     logger.warning(
                         "Webhook endpoint rejected the alert",
                         extra=log_extra(
-                            webhook_host=webhook_host,
+                            webhook_index=webhook_index,
                             status_code=response.status_code,
                         ),
                     )
             except requests.RequestException as e:
                 # Requests exceptions include the full URL in their string
-                # form, so log only the exception type and the redacted host.
+                # form, so log only the exception type and list index.
                 logger.error(
                     "Webhook delivery failed",
                     extra=log_extra(
-                        webhook_host=webhook_host,
+                        webhook_index=webhook_index,
                         error_type=type(e).__name__,
                     ),
                 )
@@ -329,7 +331,7 @@ class ASHAlertEngine:
                 logger.error(
                     "Unexpected webhook error",
                     extra=log_extra(
-                        webhook_host=webhook_host,
+                        webhook_index=webhook_index,
                         error_type=type(e).__name__,
                     ),
                 )

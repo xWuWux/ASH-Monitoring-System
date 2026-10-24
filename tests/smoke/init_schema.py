@@ -17,6 +17,13 @@ def main() -> int:
         print("ASH_DATABASE_URL is required", file=sys.stderr)
         return 2
 
+    # The consumer imports its sibling ash_observability module.  Loading the
+    # file by path does not add its directory to sys.path the way running a
+    # script does, so add it before executing the module.
+    consumer_dir = str(CONSUMER_PATH.parent)
+    if consumer_dir not in sys.path:
+        sys.path.insert(0, consumer_dir)
+
     spec = importlib.util.spec_from_file_location("ash_consumer_smoke", CONSUMER_PATH)
     if spec is None or spec.loader is None:
         print(f"cannot load {CONSUMER_PATH}", file=sys.stderr)

@@ -20,7 +20,6 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Mapping, Optional
-from urllib.parse import urlsplit
 
 # Only these extra logging fields are copied into a JSON record.  Copying
 # every record attribute would leak arbitrary objects and internal logging
@@ -41,7 +40,7 @@ LOG_EXTRA_FIELDS = (
     "remote_addr",
     "batch_size",
     "channel",
-    "webhook_host",
+    "webhook_index",
     "error_type",
 )
 
@@ -83,7 +82,7 @@ def redact_text(value: Any) -> str:
     """Return a string safe to place in a log message or traceback.
 
     Domain: any value; the result is ``str(value)`` with URL userinfo
-    (``scheme://user:pass@host``) and assignments such as ``password=...``
+    (``scheme://<userinfo>@host``) and assignments such as ``password=...``
     or ``token: ...`` replaced by ``[redacted]``.  This is a safety net for
     exception text, not a replacement for not logging a secret in the first
     place.  It intentionally leaves host, port, and path intact so an
@@ -124,35 +123,6 @@ def sanitize_request_id(value: Optional[str]) -> Optional[str]:
     if not value or not _REQUEST_ID_RE.fullmatch(value):
         return None
     return value
-
-
-def safe_url_for_log(url: str) -> str:
-    """Return only scheme and host for a URL written to a log.
-
-    Webhook URLs (Slack, Discord, and most custom integrations) carry their
-    credential in the path or query string.  Logging ``urlsplit(url).netloc``
-    alone would still expose a userinfo component, so build the result from
-    the hostname and port explicitly.
-
-    Domain: a non-empty URL string; return value is ``scheme://host[:port]``
-    with no path, query, fragment, userinfo, or secret.  Invalid or
-    host-less input returns ``<invalid-url>``.
-    """
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError:
-        return "<invalid-url>"
-
-    host = parsed.hostname
-    if not host:
-        return "<invalid-url>"
-    if ":" in host:
-        host = f"[{host}]"
-    scheme = parsed.scheme or "http"
-    if port is None:
-        return f"{scheme}://{host}"
-    return f"{scheme}://{host}:{port}"
 
 
 def _component_name(logger_name: str, default_component: str) -> str:

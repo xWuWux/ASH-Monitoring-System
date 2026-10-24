@@ -6,8 +6,9 @@ import logging
 import requests
 
 from ash_alerting import ASHAlertEngine, AlertRule
+from ash_observability import JsonFormatter
 
-SECRET = "WEBHOOK_PATH_SECRET_9c1f"
+CANARY = "WEBHOOK_PATH_CANARY_9c1f"
 
 
 def _rule():
@@ -33,18 +34,18 @@ def _capture_alert_logs():
     return logger, handler, records
 
 
-def test_webhook_failure_logs_redacted_host_only(tmp_path, monkeypatch):
+def test_webhook_failure_logs_only_the_webhook_index(tmp_path, monkeypatch):
     engine = ASHAlertEngine(
         config_path=str(tmp_path / "rules.json"),
         alert_log_path=str(tmp_path / "alerts.jsonl"),
     )
-    engine.webhooks = [f"https://hooks.slack.com/services/{SECRET}"]
+    engine.webhooks = [f"https://hooks.slack.com/services/{CANARY}"]
     logger, handler, records = _capture_alert_logs()
     try:
 
         def fail(*_args, **_kwargs):
             raise requests.ConnectionError(
-                f"failed while posting to https://hooks.slack.com/services/{SECRET}"
+                f"failed while posting to https://hooks.slack.com/services/{CANARY}"
             )
 
         monkeypatch.setattr(requests, "post", fail)
@@ -54,9 +55,41 @@ def test_webhook_failure_logs_redacted_host_only(tmp_path, monkeypatch):
 
     assert records
     record = records[-1]
-    assert record.webhook_host == "https://hooks.slack.com"
+    assert record.webhook_index == 0
     assert record.error_type == "ConnectionError"
-    assert SECRET not in str(record.__dict__)
+    assert CANARY not in str(record.__dict__)
+    formatted = JsonFormatter("ash-consumer").format(record)
+    assert CANARY not in formatted
+    assert "hooks.slack.com" not in formatted
+
+
+def test_webhook_index_identifies_the_configured_position(tmp_path, monkeypatch):
+    engine = ASHAlertEngine(
+        config_path=str(tmp_path / "rules.json"),
+        alert_log_path=str(tmp_path / "alerts.jsonl"),
+    )
+    engine.webhooks = [
+        f"https://first.example/services/{CANARY}",
+        f"https://second.example/services/{CANARY}",
+    ]
+    logger, handler, records = _capture_alert_logs()
+    try:
+
+        class RejectedResponse:
+            ok = False
+            status_code = 503
+
+        monkeypatch.setattr(requests, "post", lambda *_a, **_k: RejectedResponse())
+        engine._send_webhook(_rule(), {"hostname": "host-a"})
+    finally:
+        logger.removeHandler(handler)
+
+    assert [record.webhook_index for record in records] == [0, 1]
+    for record in records:
+        formatted = JsonFormatter("ash-consumer").format(record)
+        assert CANARY not in formatted
+        assert "first.example" not in formatted
+        assert "second.example" not in formatted
 
 
 def test_non_2xx_webhook_response_is_not_treated_as_success(tmp_path, monkeypatch):
@@ -64,7 +97,7 @@ def test_non_2xx_webhook_response_is_not_treated_as_success(tmp_path, monkeypatc
         config_path=str(tmp_path / "rules.json"),
         alert_log_path=str(tmp_path / "alerts.jsonl"),
     )
-    engine.webhooks = [f"https://hooks.slack.com/services/{SECRET}"]
+    engine.webhooks = [f"https://hooks.slack.com/services/{CANARY}"]
     logger, handler, records = _capture_alert_logs()
     try:
 
@@ -79,8 +112,8 @@ def test_non_2xx_webhook_response_is_not_treated_as_success(tmp_path, monkeypatc
 
     assert records
     assert records[-1].status_code == 403
-    assert records[-1].webhook_host == "https://hooks.slack.com"
-    assert SECRET not in str(records[-1].__dict__)
+    assert records[-1].webhook_index == 0
+    assert CANARY not in str(records[-1].__dict__)
 
 
 def test_alert_log_writes_json_to_the_configured_path(tmp_path):

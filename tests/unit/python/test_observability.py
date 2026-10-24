@@ -13,7 +13,6 @@ from ash_observability import (
     log_extra,
     new_request_id,
     redact_text,
-    safe_url_for_log,
     sanitize_request_id,
     sd_notify,
     utc_timestamp,
@@ -67,24 +66,6 @@ def test_new_request_id_is_a_uuid_string():
 )
 def test_sanitize_request_id_enforces_domain(value, expected):
     assert sanitize_request_id(value) == expected
-
-
-@pytest.mark.parametrize(
-    "url,expected",
-    [
-        ("https://hooks.slack.com/services/SECRET", "https://hooks.slack.com"),
-        (
-            "https://hooks.slack.com:8443/services/SECRET?x=1",
-            "https://hooks.slack.com:8443",
-        ),
-        ("https://user:pass@example.test/path", "https://example.test"),
-        ("http://[2001:db8::1]:8080/path", "http://[2001:db8::1]:8080"),
-        ("not-a-url", "<invalid-url>"),
-        ("https://example.test:bad/path", "<invalid-url>"),
-    ],
-)
-def test_safe_url_for_log_strips_credentials_and_path(url, expected):
-    assert safe_url_for_log(url) == expected
 
 
 def test_configure_logging_emits_one_json_object_per_record():

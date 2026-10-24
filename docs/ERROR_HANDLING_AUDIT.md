@@ -208,7 +208,6 @@ definitions, precedence rules, and security notes are in
 | `configure_logging(component, level, log_dir, ...)` (observability) | component string; level allow-list; directory or `None`; max bytes/backups ≥ 0 | — | JSON stdout plus optional bounded rotating file; idempotent |
 | `JsonFormatter(component)` (observability) | LogRecord -> one JSON object using the allow-list | — | Stable schema; no arbitrary record attributes |
 | `log_extra(**values)` (observability) | keys from `LOG_EXTRA_FIELDS` only; unknown keys dropped | — | Prevents reserved/arbitrary logging keys and unstable fields |
-| `safe_url_for_log(url)` (observability) | URL string -> `scheme://host[:port]` or `<invalid-url>` | — | Removes webhook path/query/userinfo |
 | `redact_text(value)` (observability) | any value -> string with URL userinfo and `password=`/`token:`-style assignments replaced by `[redacted]` | — | Safety net for exception text; host/port/path remain |
 | `sanitize_request_id(value)` (observability) | 1-128 chars from `[A-Za-z0-9._:-]` or `None` | — | Prevents header/log injection |
 | `sd_notify(message)` (observability) | `READY=1`, `WATCHDOG=1`, `STOPPING=1`, etc.; no-op without `NOTIFY_SOCKET` | — | Minimal systemd notification client |

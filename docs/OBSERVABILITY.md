@@ -53,7 +53,7 @@ Every consumer/API application log record is one JSON object:
 | `remote_addr` | IP string or null | API peer address; not trusted for auth |
 | `batch_size` | non-negative integer | Consumer flush failures |
 | `channel` | short string | For example `kafka`, `observability` |
-| `webhook_host` | `scheme://host[:port]` | Alert delivery; never the full URL |
+| `webhook_index` | zero-based integer | Alert delivery; position in the configured webhook list. Never the URL, host, or path, because those contain the credential. |
 | `message` / `exception` | string | Redacted centrally: URL userinfo and `password=`/`token:` assignments become `[redacted]` |
 | `error_type` | exception class or reason code | Safe replacement for exception text |
 | `exception` | stack trace string | Only where the exception text is safe to retain (consumer flush/handler errors) |
