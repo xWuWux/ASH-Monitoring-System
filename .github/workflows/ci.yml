@@ -167,6 +167,49 @@ jobs:
             --fail-on="GPL;AGPL" \
             --ignore-packages pip-licenses prettytable wcwidth
 
+  # ── 3b. OSV-Scanner (independent vulnerability database) ────────────────
+  osv-scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OSV-Scanner
+        run: |
+          curl -fsSL -o /usr/local/bin/osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64"
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+
+      - name: Scan resolved runtime dependencies
+        # requirements.txt uses ranges (>=), which OSV treats as the lowest
+        # version in the range and reports as vulnerable. Scan the versions
+        # pip actually resolves instead, matching what ships in the image.
+        run: |
+          python -m venv /tmp/osv-venv
+          /tmp/osv-venv/bin/pip install --quiet -r src/consumer/requirements.txt
+          /tmp/osv-venv/bin/pip freeze > /tmp/osv-requirements.txt
+          osv-scanner scan source --lockfile /tmp/osv-requirements.txt
+
+  # ── 3c. Dependency Review (pull requests only) ──────────────────────────
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: never
+
   # ── 4. Unit, Shell & Python Tests (blocking, with coverage) ─────────────
   unit-shell-tests:
     # kcov (see the coverage step below) was dropped from Ubuntu's archive
@@ -336,6 +379,34 @@ jobs:
           docker build -f deployments/docker/Dockerfile.api -t ash-api:ci .
           docker build -f deployments/docker/Dockerfile.consumer -t ash-consumer:ci .
 
+  # ── 6b. Log-Leak / Secret-Egress Tests (every push and PR) ──────────────
+  log-leak-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install BATS
+        run: |
+          git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats
+          sudo /tmp/bats/install.sh /usr/local
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq inotify-tools uuid-runtime
+          pip install -r src/consumer/requirements.txt pytest
+
+      - name: Agent log-leak tests
+        run: bats --verbose-run tests/security/test_log_leak.bats
+
+      - name: API log-leak tests
+        run: pytest tests/security/python -v
+
   # ── 7. Integration Tests & Migration Checks ──────────────────────────────
   integration-migration:
     runs-on: ubuntu-latest
@@ -450,9 +521,11 @@ jobs:
         lint-format-secrets,
         build,
         security-compliance,
+        osv-scanner,
         unit-shell-tests,
         degradation-tests,
         smoke-tests,
+        log-leak-test,
         integration-migration,
         build-package,
       ]
