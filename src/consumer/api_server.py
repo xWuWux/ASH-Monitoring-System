@@ -6,7 +6,8 @@ Provides JWT-based authentication and RBAC.
 
 import hmac
 import os
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 import jwt
@@ -15,6 +16,7 @@ from flask import Flask, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from psycopg2.extras import RealDictCursor
+from werkzeug.exceptions import BadRequest
 
 
 def _require_env(name: str) -> str:
@@ -83,6 +85,57 @@ def rate_limit_exceeded(_e):
     return jsonify({"error": "Too many requests, try again later"}), 429
 
 
+@app.errorhandler(BadRequest)
+def invalid_request(error):
+    # Query-string and path validation raises BadRequest; keep the response
+    # JSON so API clients never have to parse Flask's default HTML error page.
+    return jsonify({"error": error.description}), 400
+
+
+def _int_arg(name, default, maximum=None, minimum=0):
+    """Parse a non-negative integer query parameter.
+
+    int() on arbitrary query-string input (and negative LIMIT/OFFSET values)
+    previously reached PostgreSQL and surfaced as a 500. Invalid input is a
+    client error, so reject it before touching the database.
+    """
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise BadRequest(f"{name} must be an integer")
+    if value < minimum:
+        raise BadRequest(f"{name} must be >= {minimum}")
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
+
+
+def _uuid_arg(value, name):
+    try:
+        return str(uuid.UUID(value))
+    except (TypeError, ValueError, AttributeError):
+        raise BadRequest(f"{name} must be a UUID")
+
+
+def _timestamp_arg(name):
+    raw = request.args.get(name)
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise BadRequest(f"{name} must be an ISO-8601 timestamp")
+    # command_logs.log_timestamp is TIMESTAMP (without time zone), so pass a
+    # naive UTC value rather than relying on an implicit cast.
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 def require_role(*roles):
     def decorator(f):
         @wraps(f)
@@ -143,11 +196,12 @@ def create_token():
     if role is None:
         return jsonify({"error": "Invalid credentials"}), 401
 
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": username,
         "role": role,
-        "iat": datetime.utcnow(),
-        "exp": datetime.utcnow() + timedelta(hours=app.config["JWT_EXPIRY_HOURS"]),
+        "iat": now,
+        "exp": now + timedelta(hours=app.config["JWT_EXPIRY_HOURS"]),
     }
     token = jwt.encode(payload, app.config["JWT_SECRET"], algorithm="HS256")
     return jsonify(
@@ -166,10 +220,12 @@ def search_events():
     event_type = request.args.get("event_type")
     source = request.args.get("source")
     session_id = request.args.get("session_id")
-    start_time = request.args.get("start_time")
-    end_time = request.args.get("end_time")
-    limit = min(int(request.args.get("limit", 100)), 1000)
-    offset = int(request.args.get("offset", 0))
+    if session_id:
+        session_id = _uuid_arg(session_id, "session_id")
+    start_time = _timestamp_arg("start_time")
+    end_time = _timestamp_arg("end_time")
+    limit = _int_arg("limit", 100, maximum=1000)
+    offset = _int_arg("offset", 0)
 
     query = "SELECT event_id, hostname, source, event_type, username, command, cwd, exit_code, log_timestamp, session_id, risk_score FROM command_logs WHERE 1=1"
     params = []
@@ -234,6 +290,7 @@ def search_events():
 @require_role("admin", "analyst", "readonly")
 def get_event(event_id):
     """Get a single event by ID with full details."""
+    event_id = _uuid_arg(event_id, "event_id")
     conn = get_db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -256,7 +313,7 @@ def list_sessions():
     """List sessions with optional filters."""
     hostname = request.args.get("hostname")
     user = request.args.get("user")
-    limit = min(int(request.args.get("limit", 50)), 200)
+    limit = _int_arg("limit", 50, maximum=200)
 
     query = "SELECT * FROM sessions WHERE 1=1"
     params = []
@@ -286,6 +343,7 @@ def list_sessions():
 @require_role("admin", "analyst", "readonly")
 def get_session(session_id):
     """Get session details with all events (session replay)."""
+    session_id = _uuid_arg(session_id, "session_id")
     conn = get_db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -344,8 +402,8 @@ def list_hosts():
 @require_role("admin", "analyst")
 def top_commands():
     """Most frequent commands in the last 24h."""
-    limit = min(int(request.args.get("limit", 20)), 100)
-    hours = min(int(request.args.get("hours", 24)), 720)
+    limit = _int_arg("limit", 20, maximum=100)
+    hours = _int_arg("hours", 24, maximum=720, minimum=1)
 
     conn = get_db()
     try:
@@ -376,7 +434,7 @@ def top_commands():
 @require_role("admin", "analyst")
 def event_timeline():
     """Event frequency over time (bucketed)."""
-    hours = min(int(request.args.get("hours", 24)), 720)
+    hours = _int_arg("hours", 24, maximum=720, minimum=1)
 
     conn = get_db()
     try:
@@ -404,7 +462,7 @@ def event_timeline():
 @require_role("admin", "analyst")
 def risky_events():
     """Highest risk score events."""
-    limit = min(int(request.args.get("limit", 50)), 200)
+    limit = _int_arg("limit", 50, maximum=200)
 
     conn = get_db()
     try:
@@ -433,7 +491,7 @@ def risky_events():
 def list_alerts():
     """List triggered alerts."""
     severity = request.args.get("severity")
-    limit = min(int(request.args.get("limit", 50)), 200)
+    limit = _int_arg("limit", 50, maximum=200)
 
     conn = get_db()
     try:

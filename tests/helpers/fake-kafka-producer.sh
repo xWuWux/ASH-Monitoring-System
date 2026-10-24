@@ -5,6 +5,8 @@
 #   success (default) -- consume the message and succeed
 #   fail              -- consume the message and fail every attempt
 #   flaky             -- fail until the attempt count reaches FAKE_KAFKA_SUCCEED_ON
+#   hang              -- consume the message, then block until killed (tests
+#                        the timeout around the real producer)
 #
 # FAKE_KAFKA_LOG records the command-line arguments, FAKE_KAFKA_MESSAGES
 # records the payload, and FAKE_KAFKA_COUNT_FILE tracks attempts in flaky mode.
@@ -39,6 +41,11 @@ case "${FAKE_KAFKA_MODE:-success}" in
             exit 0
         fi
         exit 1
+        ;;
+    hang)
+        # exec so the process that timeout(1) signals is the sleeping
+        # process itself, not a bash parent that would wait for its child.
+        exec sleep "${FAKE_KAFKA_HANG_SECONDS:-300}"
         ;;
     *)
         echo "unknown FAKE_KAFKA_MODE: ${FAKE_KAFKA_MODE}" >&2

@@ -91,6 +91,77 @@ pending_count() {
     [[ $output == *"PASS: All 3 entries verified successfully"* ]]
 }
 
+@test "concurrent processes cannot fork the hash chain" {
+    # Every terminal session on a host appends to the same hash file. Before
+    # the lock was added, 20 parallel emitters forked the chain and produced
+    # dozens of integrity errors.
+    local agent="${BATS_TEST_DIRNAME}/../../src/agent/ash-agent.sh"
+    local emitter="$BATS_TEST_TMPDIR/emit.sh"
+
+    cat >"$emitter" <<'SCRIPT'
+#!/usr/bin/env bash
+source "$1" --functions-only 2>/dev/null || true
+trap - DEBUG RETURN ERR EXIT 2>/dev/null || true
+set +e
+hash_chain_init
+load_redaction_rules
+spool_init
+emit_event "command_start" "{\"command\":\"echo child-$2\"}"
+SCRIPT
+    chmod +x "$emitter"
+
+    local pids=()
+    for i in $(seq 1 20); do
+        bash "$emitter" "$agent" "$i" &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+
+    [[ $(wc -l <"$ASH_EVENTS_FILE" | tr -d ' ') -eq 20 ]]
+    run verify_hash_chain "$ASH_EVENTS_FILE"
+    [[ $status -eq 0 ]]
+    [[ $output == *"PASS: All 20 entries verified successfully"* ]]
+}
+
+@test "background subshells sharing one PID cannot corrupt the chain" {
+    # Background subshells inherit the parent's $$; the temp-file name in
+    # safe_log_write() used to be based on $$ and could collide here.
+    local pids=()
+    for i in $(seq 1 10); do
+        (
+            emit_event "command_start" "{\"command\":\"echo background-$i\"}"
+        ) &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+
+    [[ $(wc -l <"$ASH_EVENTS_FILE" | tr -d ' ') -eq 10 ]]
+    run verify_hash_chain "$ASH_EVENTS_FILE"
+    [[ $status -eq 0 ]]
+}
+
+@test "concurrent safe_log_write calls do not lose or duplicate lines" {
+    local target="$BATS_TEST_TMPDIR/concurrent.log"
+    local pids=()
+
+    for i in $(seq 1 20); do
+        (
+            safe_log_write "line-$i" "$target"
+        ) &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+
+    [[ $(wc -l <"$target" | tr -d ' ') -eq 20 ]]
+    [[ $(sort -u "$target" | wc -l | tr -d ' ') -eq 20 ]]
+}
+
 @test "verify_hash_chain detects content tampering" {
     emit_event "command_start" '{"command":"echo original"}'
     emit_event "command_start" '{"command":"echo second"}'

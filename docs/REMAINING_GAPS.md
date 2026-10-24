@@ -139,12 +139,16 @@ The roadmap calls for testing:
 - Filesystem corruption of spool directory
 - OOM kill of agent process
 
-**Current state**: `tests/degradation/` now covers Kafka outages, missing
-optional dependencies (`jq`, `inotifywait`), spool-write failures, lost
-database connections, and crash recovery on every CI build. `tests/smoke/`
-runs the agent event pipeline and a real API + PostgreSQL smoke test. Still
-**not automated**: disk-full, OOM-kill, network-partition, and spool-corruption
-scenarios.
+**Current state**: `tests/degradation/` now covers Kafka outages, a producer
+that hangs after accepting the connection (bounded by `KAFKA_SEND_TIMEOUT`),
+missing optional dependencies (`jq`, `inotifywait`), spool-write failures,
+lost database connections, and crash recovery on every CI build.
+`tests/smoke/` runs the agent event pipeline and a real gunicorn API +
+PostgreSQL smoke test, including a 50-concurrent-request p95 latency check.
+`tests/unit/test_events.bats` covers concurrent hash-chain writers and
+subshell temp-file collisions. Still **not automated**: disk-full, OOM-kill,
+network-partition (`tc netem` is unavailable/unreliable on hosted runners),
+and spool-corruption scenarios.
 
 ---
 
