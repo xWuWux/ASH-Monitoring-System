@@ -55,7 +55,11 @@ run_validate_config() {
 }
 
 @test "validate_config fails with unwritable log dir" {
-    export ASH_LOG_DIR="/nonexistent/path/that/cannot/be/created"
+    # A path whose parent is a regular file fails even when the suite runs as
+    # root, unlike an unwritable directory (root bypasses permission bits).
+    local blocker="${BATS_TEST_TMPDIR}/not-a-directory"
+    : >"$blocker"
+    export ASH_LOG_DIR="${blocker}/logs"
     run_validate_config
     [[ $status -ne 0 ]]
 }

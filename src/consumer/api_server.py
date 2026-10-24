@@ -207,11 +207,14 @@ def search_events():
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(query, params)
             results = cursor.fetchall()
-            # Get total count
+            # Get total count. Drop the trailing ORDER BY/LIMIT/OFFSET:
+            # PostgreSQL rejects ORDER BY on a plain COUNT(*) aggregate
+            # (column must appear in GROUP BY), and LIMIT/OFFSET do not
+            # belong in a total. params[:-2] already drops limit/offset.
             count_query = query.replace(
                 "SELECT event_id, hostname, source, event_type, username, command, cwd, exit_code, log_timestamp, session_id, risk_score",
                 "SELECT COUNT(*)",
-            ).rsplit("LIMIT", 1)[0]
+            ).split(" ORDER BY ", 1)[0]
             cursor.execute(count_query, params[:-2])
             total = cursor.fetchone()["count"]
     finally:
