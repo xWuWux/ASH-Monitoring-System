@@ -181,10 +181,15 @@ wait_for_log "Kafka consumer initialized"
 echo "Waiting for consumer group assignment..."
 assigned=0
 for _ in $(seq 1 30); do
+    # Match the assignment column ("topic(0)"), not the bare topic name.
+    # The group is named "ash-e2e-group-<...>" and the topic "ash-e2e-<...>",
+    # so a bare-topic grep matched the group name in the CLI header and
+    # returned before the consumer had any partition. The event was then
+    # produced before assignment, and auto_offset_reset=latest skipped it.
     if kafka-consumer-groups.sh \
         --bootstrap-server "$BROKER" \
         --describe --group "$GROUP" --members --verbose 2>/dev/null |
-        grep -Fq "$TOPIC"; then
+        grep -Fq "${TOPIC}("; then
         assigned=1
         break
     fi
