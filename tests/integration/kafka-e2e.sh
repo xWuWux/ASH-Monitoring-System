@@ -38,6 +38,14 @@ for value_name in TIMEOUT METRICS_PORT; do
         exit 2
     fi
 done
+if ((TIMEOUT < 1)); then
+    echo "TIMEOUT must be at least 1 second" >&2
+    exit 2
+fi
+if ((METRICS_PORT < 1 || METRICS_PORT > 65535)); then
+    echo "METRICS_PORT must be between 1 and 65535" >&2
+    exit 2
+fi
 
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ash-kafka-e2e.XXXXXX")
 CONSUMER_PID=""
