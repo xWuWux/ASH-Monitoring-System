@@ -67,6 +67,8 @@ cleanup() {
     if [[ $status -ne 0 ]]; then
         echo "--- consumer log ---" >&2
         tail -n 100 "$WORK_DIR/consumer.log" 2>/dev/null || true
+        echo "--- consumer stderr ---" >&2
+        tail -n 40 "$WORK_DIR/consumer.err" 2>/dev/null || true
         echo "--- agent events ---" >&2
         tail -n 10 "$WORK_DIR/log/events.jsonl" 2>/dev/null || true
     fi
@@ -155,8 +157,11 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 
 echo "Starting consumer..."
+# Application JSON logs go to stdout.  Keep stderr separate: third-party
+# libraries (for example kafka-python's deserializer warning) write there,
+# and merging the two would make the JSON-per-line assertion invalid.
 python3 "$ROOT/src/consumer/ash-consumer.py" "$WORK_DIR/consumer.conf" \
-    >"$WORK_DIR/consumer.log" 2>&1 &
+    >"$WORK_DIR/consumer.log" 2>"$WORK_DIR/consumer.err" &
 CONSUMER_PID=$!
 
 wait_for_log() {
