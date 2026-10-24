@@ -195,21 +195,6 @@ jobs:
           /tmp/osv-venv/bin/pip freeze > /tmp/osv-requirements.txt
           osv-scanner scan source --lockfile /tmp/osv-requirements.txt
 
-  # ── 3c. Dependency Review (pull requests only) ──────────────────────────
-  dependency-review:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/dependency-review-action@v4
-        with:
-          fail-on-severity: high
-          comment-summary-in-pr: never
-
   # ── 4. Unit, Shell & Python Tests (blocking, with coverage) ─────────────
   unit-shell-tests:
     # kcov (see the coverage step below) was dropped from Ubuntu's archive

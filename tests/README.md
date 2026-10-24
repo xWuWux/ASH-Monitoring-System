@@ -42,9 +42,9 @@ bash tests/smoke/smoke-api.sh
 
 ## Security scanning
 
-`ci.yml` runs Bandit, Semgrep, `pip-audit`, OSV-Scanner, `detect-secrets`, and
-Dependency Review (PRs only). CodeQL runs from `.github/workflows/codeql.yml`
-for Python and GitHub Actions. `tests/security/` is the regression gate that
-proves secrets are redacted before they reach the event log, agent log, spool,
-Kafka, file-change diffs, or API responses.
+`ci.yml` runs Bandit, Semgrep, `pip-audit`, OSV-Scanner, and `detect-secrets`.
+CodeQL runs from `.github/workflows/codeql.yml` for Python and GitHub Actions.
+`tests/security/` is the regression gate that proves secrets are redacted
+before they reach the event log, agent log, spool, Kafka, file-change diffs, or
+API responses.
 
