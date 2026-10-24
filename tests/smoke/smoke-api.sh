@@ -73,7 +73,15 @@ finally:
 PY
 
 echo "Starting API on ${ASH_API_HOST}:${PORT}..."
-python3 "$ROOT/src/consumer/api_server.py" >"$API_LOG" 2>&1 &
+# Use the same WSGI server as the production image (Dockerfile.api) rather
+# than Flask's development server, so the smoke test also covers gunicorn's
+# import path and worker startup.
+gunicorn \
+    --chdir "$ROOT/src/consumer" \
+    --bind "${ASH_API_HOST}:${PORT}" \
+    --workers "${ASH_API_WORKERS:-4}" \
+    --timeout 30 \
+    api_server:app >"$API_LOG" 2>&1 &
 API_PID=$!
 
 BASE_URL="http://${ASH_API_HOST}:${PORT}"
@@ -147,6 +155,11 @@ assert data["events"][0]["command"] == "ash-smoke-command", data
 assert data["events"][0]["hostname"] == "smoke-host", data
 print(f"events: query ok ({data['total']} matching)")
 PY
+
+echo "Checking response time under light concurrent load..."
+ASH_API_BASE_URL="$BASE_URL" \
+    ASH_API_TOKEN="$token" \
+    python3 "$ROOT/tests/performance/load_api.py"
 
 echo "Checking unauthenticated access is rejected..."
 status=$(

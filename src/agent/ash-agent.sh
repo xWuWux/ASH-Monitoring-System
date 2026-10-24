@@ -158,7 +158,10 @@ validate_config() {
 safe_log_write() {
     local content="$1"
     local target_file="${2:-${ASH_EVENTS_FILE}}"
-    local temp_file="${ASH_TEMP_DIR}/write.$$.tmp"
+    # BASHPID, not $$: background subshells and command substitutions share
+    # the parent's $$, so two concurrent writers could pick the same temp
+    # path and one would truncate the other's content before it was appended.
+    local temp_file="${ASH_TEMP_DIR}/write.${BASHPID:-$$}.tmp"
 
     printf '%s\n' "$content" >"$temp_file" 2>/dev/null || return 1
 
@@ -279,17 +282,32 @@ redact_sensitive_data() {
 # ─── Hash-Chained Append-Only Logs ─────────────────────────────��────────────
 hash_chain_init() {
     if [[ ! -f "${ASH_HASH_FILE}" ]]; then
-        echo "0000000000000000000000000000000000000000000000000000000000000000" >"${ASH_HASH_FILE}"
-        # 600, not 400: hash_chain_append() must keep appending to this file
-        # for the life of the process. 400 (no write bit, even for the
-        # owner) blocks that on every non-root run and only ever "worked"
-        # because DAC checks don't apply to root, which is how this agent
-        # has always been deployed so far (see deployments/systemd/*).
-        chmod 600 "${ASH_HASH_FILE}" 2>/dev/null || true
+        (
+            # Two sessions can start at the same time on a host that has
+            # never run ASH. Without the lock both can see the missing file
+            # and one can truncate the genesis value the other just wrote.
+            exec {lock_fd}>"${ASH_HASH_FILE}.lock"
+            flock -x "$lock_fd"
+            if [[ ! -f "${ASH_HASH_FILE}" ]]; then
+                echo "0000000000000000000000000000000000000000000000000000000000000000" >"${ASH_HASH_FILE}"
+                # 600, not 400: hash_chain_append() must keep appending to this
+                # file for the life of the process. 400 (no write bit, even for
+                # the owner) blocks that on every non-root run and only ever
+                # "worked" because DAC checks don't apply to root, which is how
+                # this agent has always been deployed so far (see
+                # deployments/systemd/*).
+                chmod 600 "${ASH_HASH_FILE}" 2>/dev/null || true
+            fi
+        )
     fi
 }
 
-hash_chain_append() {
+# Read the last hash, sign the event, and append the new hash to the chain
+# file. Callers must hold the ${ASH_HASH_FILE}.lock that hash_chain_append()
+# and emit_event() take. Keeping this separate lets emit_event() hold one lock
+# across both the hash append and the event-log append, so the two files stay
+# in the same order.
+_hash_chain_append_unlocked() {
     local event_json="$1"
     local prev_hash
     # Re-read the file on every call rather than caching the last hash in a
@@ -317,6 +335,18 @@ hash_chain_append() {
 
     echo "$current_hash" >>"${ASH_HASH_FILE}"
     echo "$signed_event"
+}
+
+hash_chain_append() {
+    (
+        # Re-reading the file is not enough on its own: two sessions can
+        # both read the same prev_hash before either appends, producing two
+        # events that fork the chain. Serialize the read/compute/append
+        # sequence across every process sharing this host's chain.
+        exec {lock_fd}>"${ASH_HASH_FILE}.lock"
+        flock -x "$lock_fd"
+        _hash_chain_append_unlocked "$1"
+    )
 }
 
 verify_hash_chain() {
@@ -424,9 +454,19 @@ send_to_kafka_raw() {
     local message="$1"
     local max_retries=3
     local retry=0
+    local -a producer=(kafka-console-producer.sh)
+    local send_timeout="${KAFKA_SEND_TIMEOUT:-10}"
+
+    # A producer that connects but never returns (broker accepts the TCP
+    # connection and then stops responding) would otherwise block spool_flush
+    # forever: the retry loop never advances because the command never exits.
+    # timeout(1) turns that hang into an ordinary failed attempt.
+    if command -v timeout >/dev/null 2>&1; then
+        producer=(timeout "${send_timeout}" kafka-console-producer.sh)
+    fi
 
     while [[ $retry -lt $max_retries ]]; do
-        if printf '%s\n' "$message" | kafka-console-producer.sh \
+        if printf '%s\n' "$message" | "${producer[@]}" \
             --broker-list "${KAFKA_BROKER}" \
             --topic "${KAFKA_TOPIC}" \
             --request-required-acks 1 \
@@ -511,12 +551,18 @@ emit_event() {
         fi
     fi
 
-    # Hash chain signing
-    local signed_event
-    signed_event=$(hash_chain_append "$event")
-
-    # Write to local events log
+    # Hash chain signing and the event-log append must happen under the same
+    # lock. Taking the lock inside hash_chain_append() alone keeps the hash
+    # file consistent, but releases it before safe_log_write() runs, so two
+    # sessions can append their hashes in one order and their events in the
+    # other, breaking verify_hash_chain() even though every hash is correct.
+    local signed_event lock_fd
+    exec {lock_fd}>"${ASH_HASH_FILE}.lock"
+    flock -x "$lock_fd"
+    signed_event=$(_hash_chain_append_unlocked "$event")
     safe_log_write "$signed_event"
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
 
     # Forward to Kafka spool
     if [[ "${KAFKA_ENABLED}" == "true" ]]; then

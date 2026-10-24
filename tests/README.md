@@ -14,7 +14,9 @@ every push and pull request.
 | `tests/unit/python/` | Consumer processing/batching and API auth/health |
 | `tests/degradation/python/` | Database/Kafka startup failures, DLQ writes, degraded API health |
 | `tests/security/python/` | API responses never echo credentials, tokens, or DB URLs |
-| `tests/smoke/smoke-api.sh` | Real Flask API + PostgreSQL: health, auth, search, RBAC rejection |
+| `tests/contract/` | API response contract against real PostgreSQL: every endpoint, filters, pagination, invalid input, RBAC |
+| `tests/smoke/smoke-api.sh` | Real gunicorn API + PostgreSQL: health, auth, search, RBAC rejection, load check |
+| `tests/performance/load_api.py` | 50 concurrent `GET /api/v1/events` requests, p95 < 500ms |
 | `tests/performance/benchmark.sh` | Report-only hash-chain + redaction throughput |
 
 ## Running locally
@@ -32,7 +34,12 @@ bats tests/security/*.bats
 pip install -r src/consumer/requirements.txt pytest pytest-cov
 pytest tests/unit/python tests/degradation/python tests/security/python -v
 
-# API smoke test (needs a reachable PostgreSQL)
+# API contract tests (needs a reachable PostgreSQL)
+ASH_DATABASE_URL='postgresql://ash:password@localhost:5432/ash_logs' \
+ASH_ADMIN_USER='admin' ASH_ADMIN_PASS='local-test-password' \
+    pytest tests/contract -v
+
+# API smoke test + 50-request load check (needs a reachable PostgreSQL)
 export ASH_DATABASE_URL='postgresql://ash:password@localhost:5432/ash_logs'
 export ASH_JWT_SECRET='local-test-secret'
 export ASH_ADMIN_USER='admin'

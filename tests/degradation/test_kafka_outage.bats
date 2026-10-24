@@ -76,6 +76,25 @@ sent_count() {
     [[ $(pending_count) -eq 1 ]]
 }
 
+@test "a hung producer is abandoned after KAFKA_SEND_TIMEOUT" {
+    # The broker accepted the connection but never answers: without a
+    # timeout the flush loop blocks forever and the spool never drains.
+    export FAKE_KAFKA_MODE=hang
+    export FAKE_KAFKA_HANG_SECONDS=60
+    export KAFKA_SEND_TIMEOUT=1
+
+    emit_event "command_start" '{"command":"echo hung-producer"}'
+
+    started=$(date +%s)
+    run spool_flush
+    elapsed=$(($(date +%s) - started))
+
+    [[ $status -ne 0 ]]
+    [[ $elapsed -lt 30 ]]
+    [[ $(pending_count) -eq 1 ]]
+    [[ $(sent_count) -eq 0 ]]
+}
+
 @test "spooled events drain after Kafka recovers" {
     emit_event "command_start" '{"command":"echo first"}'
     emit_event "command_start" '{"command":"echo second"}'
