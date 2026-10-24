@@ -7,10 +7,21 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 jobs:
-  # ── 1. Lint, Format & Secret Scan (fastest) ─────────────────────────────
+  # ── 1. Lint, Format, Config & Secret Scan (fastest) ─────────────────────
   lint-format-secrets:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Placeholders only: docker compose config validates the file without
+      # connecting to anything. The `${VAR:?}` guards still need values.
+      ASH_DB_PASSWORD: ci-placeholder
+      ASH_JWT_SECRET: ci-placeholder
+      ASH_ADMIN_USER: ci-placeholder
+      ASH_ADMIN_PASS: ci-placeholder
     steps:
       - uses: actions/checkout@v4
 
@@ -22,30 +33,46 @@ jobs:
             "https://github.com/mvdan/sh/releases/download/v3.9.0/shfmt_v3.9.0_linux_amd64"
           chmod +x /usr/local/bin/shfmt
 
-      - name: Install Python lint/format tools
-        run: pip install flake8 black detect-secrets
-
-      - name: ShellCheck
+      - name: Install actionlint
         run: |
-          find src scripts -type f -name "*.sh" \
+          curl -fsSL -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz"
+          tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint
+
+      - name: Install Python lint/format tools
+        run: pip install flake8 black detect-secrets yamllint
+
+      - name: ShellCheck (src, scripts, test helpers)
+        run: |
+          find src scripts tests -type f -name "*.sh" \
             ! -path "*/shells/zsh-integration.sh" \
             -print0 | xargs -0 -r shellcheck -S error
 
       - name: shfmt (format check)
         run: |
-          find src scripts -type f -name "*.sh" \
+          find src scripts tests -type f -name "*.sh" \
             ! -path "*/shells/zsh-integration.sh" \
             -print0 | xargs -0 shfmt -d -i 4 -ci
+
+      - name: actionlint (workflow syntax and expressions)
+        run: actionlint .github/workflows/*.yml
+
+      - name: yamllint (workflows + compose)
+        run: yamllint --strict .github/workflows deployments/docker/docker-compose.yml
+
+      - name: docker compose config
+        run: docker compose -f deployments/docker/docker-compose.yml config --quiet
 
       - name: flake8
         run: |
           # E203: black intentionally adds a space before ':' in slices
           # (PEP8-compliant); flake8's default rule disagrees with black.
           # This is black's own documented recommendation, not a local hack.
-          flake8 src/consumer/ --max-line-length=120 --ignore=E501,W503,E226,E203
+          flake8 src/consumer tests \
+            --max-line-length=120 --ignore=E501,W503,E226,E203
 
       - name: black (format check)
-        run: black --check src/consumer/
+        run: black --check src/consumer tests
 
       - name: detect-secrets (fail on newly introduced secrets only)
         run: |
@@ -77,9 +104,10 @@ jobs:
           print('No new secrets detected.')
           "
 
-  # ── 2. Build Test (does it compile?) ────────────────────────────────────
+  # ── 2. Build Test (does it compile/parse?) ──────────────────────────────
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -88,16 +116,23 @@ jobs:
           status=0
           while IFS= read -r -d '' f; do
             bash -n "$f" || status=1
-          done < <(find src scripts -type f -name "*.sh" \
+          done < <(find src scripts tests -type f -name "*.sh" \
             ! -path "*/shells/zsh-integration.sh" -print0)
           exit $status
 
       - name: Python syntax check
-        run: python3 -m py_compile src/consumer/*.py
+        run: python3 -m compileall -q src/consumer tests
+
+      - name: JSON validation
+        run: |
+          for f in config/*.json.example src/common/schema/event-v1.json; do
+            jq -e . "$f" >/dev/null
+          done
 
   # ── 3. Security & Compliance (SAST + SCA + license check) ───────────────
   security-compliance:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [lint-format-secrets, build]
     steps:
       - uses: actions/checkout@v4
@@ -132,14 +167,14 @@ jobs:
             --fail-on="GPL;AGPL" \
             --ignore-packages pip-licenses prettytable wcwidth
 
-  # ── 4. Unit & Shell Tests (blocking, with coverage measurement) ─────────
+  # ── 4. Unit, Shell & Python Tests (blocking, with coverage) ─────────────
   unit-shell-tests:
     # kcov (see the coverage step below) was dropped from Ubuntu's archive
     # starting with noble (24.04, what ubuntu-latest now points to) -- it's
     # only packaged for jammy (22.04). Pinned here so the coverage step
     # actually works instead of silently never running.
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -151,7 +186,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq inotify-tools uuid-runtime
+          sudo apt-get install -y -qq jq inotify-tools uuid-runtime zsh fish
           pip install -r src/consumer/requirements.txt pytest pytest-cov
 
       - name: Install kcov (best-effort -- coverage step is report-only)
@@ -172,11 +207,18 @@ jobs:
             timeout 90s bats --verbose-run "$test_file"
           done
 
+      - name: Run BATS shell-integration tests (blocking)
+        run: |
+          for test_file in tests/shell/*.bats; do
+            echo "===== ${test_file} ====="
+            timeout 90s bats --verbose-run "$test_file"
+          done
+
       - name: Shell coverage (report only, no threshold yet)
         continue-on-error: true
         run: |
           mkdir -p coverage
-          for test_file in tests/unit/*.bats tests/regression/*.bats; do
+          for test_file in tests/unit/*.bats tests/regression/*.bats tests/shell/*.bats; do
             name=$(basename "$test_file")
             kcov --include-path="${GITHUB_WORKSPACE}/src/agent" \
               "coverage/${name}" bats "$test_file" || true
@@ -189,7 +231,7 @@ jobs:
             echo "Could not locate kcov's merged coverage.json -- see uploaded artifact" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload coverage report
+      - name: Upload shell coverage report
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -197,17 +239,107 @@ jobs:
           path: coverage/
           if-no-files-found: ignore
 
-      - name: Run Python unit tests (with coverage, once tests exist)
+      - name: Run Python unit tests (with coverage)
         run: |
-          if find tests/unit/python -name 'test_*.py' 2>/dev/null | grep -q .; then
-            pytest tests/unit/python/ -v --cov=src/consumer --cov-report=term --cov-report=xml
-          else
-            echo "No Python unit tests yet (tests/unit/python/) -- add tests before this can gate on coverage"
-          fi
+          pytest tests/unit/python -v \
+            --cov=src/consumer --cov-report=term --cov-report=xml
 
-  # ── 5. Integration Tests & Migration Checks ──────────────────────────────
+      - name: Upload Python coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-report
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  # ── 5. Degradation / Chaos Tests (every push and PR) ────────────────────
+  degradation-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install BATS
+        run: |
+          git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats
+          sudo /tmp/bats/install.sh /usr/local
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq inotify-tools uuid-runtime
+          pip install -r src/consumer/requirements.txt pytest
+
+      - name: Run BATS degradation tests (blocking)
+        run: |
+          for test_file in tests/degradation/*.bats; do
+            echo "===== ${test_file} ====="
+            timeout 90s bats --verbose-run "$test_file"
+          done
+
+      - name: Run Python degradation tests (blocking)
+        run: pytest tests/degradation/python -v
+
+  # ── 6. Smoke Tests (every push and PR) ──────────────────────────────────
+  smoke-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [build]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ash_logs
+          POSTGRES_USER: ash
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install BATS
+        run: |
+          git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats
+          sudo /tmp/bats/install.sh /usr/local
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq inotify-tools uuid-runtime
+          pip install -r src/consumer/requirements.txt
+
+      - name: Run agent pipeline smoke test
+        run: bats --verbose-run tests/smoke/test_agent_pipeline.bats
+
+      - name: Run API smoke test against PostgreSQL
+        env:
+          ASH_DATABASE_URL: postgresql://ash:test_password@localhost:5432/ash_logs
+          ASH_JWT_SECRET: ci-smoke-jwt-secret-not-for-production
+          ASH_ADMIN_USER: smoke-admin
+          ASH_ADMIN_PASS: ci-smoke-password
+        run: bash tests/smoke/smoke-api.sh
+
+      - name: Build deployment images
+        run: |
+          docker build -f deployments/docker/Dockerfile.api -t ash-api:ci .
+          docker build -f deployments/docker/Dockerfile.consumer -t ash-consumer:ci .
+
+  # ── 7. Integration Tests & Migration Checks ──────────────────────────────
   integration-migration:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [unit-shell-tests, security-compliance]
     services:
       postgres:
@@ -292,6 +424,7 @@ jobs:
   # ── Build installable package (existing artifact build) ─────────────────
   build-package:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: [integration-migration]
     steps:
       - uses: actions/checkout@v4
@@ -318,13 +451,15 @@ jobs:
         build,
         security-compliance,
         unit-shell-tests,
+        degradation-tests,
+        smoke-tests,
         integration-migration,
         build-package,
       ]
     steps:
       - run: echo "Ready for code review and merge."
 
-  # ── 6. Ephemeral Deploy & Performance Benchmarks (optional/contextual) ──
+  # ── 8. Ephemeral Deploy & Performance Benchmarks (optional/contextual) ──
   # Not part of the required-to-merge chain above: spins up the full
   # docker-compose stack, which is slow and heavier than a PR should have to
   # wait on for every push. Runs on push to main, or on demand.
@@ -332,10 +467,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: [build-package]
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       ASH_DB_PASSWORD: ci-ephemeral-test-password
       ASH_JWT_SECRET: ci-ephemeral-test-jwt-secret-not-for-real-use
+      ASH_ADMIN_USER: ci-ephemeral-admin
+      ASH_ADMIN_PASS: ci-ephemeral-password
     steps:
       - uses: actions/checkout@v4
 

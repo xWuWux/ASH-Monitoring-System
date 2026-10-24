@@ -139,7 +139,12 @@ The roadmap calls for testing:
 - Filesystem corruption of spool directory
 - OOM kill of agent process
 
-**Current state**: Spool queue and retry logic handle most of these gracefully, but no automated chaos tests verify it.
+**Current state**: `tests/degradation/` now covers Kafka outages, missing
+optional dependencies (`jq`, `inotifywait`), spool-write failures, lost
+database connections, and crash recovery on every CI build. `tests/smoke/`
+runs the agent event pipeline and a real API + PostgreSQL smoke test. Still
+**not automated**: disk-full, OOM-kill, network-partition, and spool-corruption
+scenarios.
 
 ---
 

@@ -88,7 +88,10 @@ services:
       ASH_API_PORT: "8080"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      # python:3.12-slim does not ship curl; use the interpreter the image
+      # already has. A non-2xx /health response (including the expected 503
+      # degraded response) raises and marks the container unhealthy.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 10s
       timeout: 3s
       retries: 3
