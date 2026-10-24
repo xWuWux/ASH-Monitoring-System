@@ -38,3 +38,4 @@ def test_health_reports_degraded_when_the_database_is_down(
 
     assert response.status_code == 503
     assert response.get_json() == {"status": "degraded", "database": "disconnected"}
+    assert api_module.API_DATABASE_AVAILABLE._value.get() == 0

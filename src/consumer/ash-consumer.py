@@ -7,7 +7,6 @@ retry logic, structured event validation, and Prometheus metrics.
 
 import gzip
 import json
-import logging
 import os
 import signal
 import sys
@@ -15,8 +14,11 @@ import time
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
@@ -26,7 +28,43 @@ from kafka import KafkaConsumer
 # KafkaConsumer(...) construction now raises KafkaTimeoutError instead. See
 # https://kafka-python.readthedocs.io/en/3.0.1/upgrade_to_3_0.html
 from kafka.errors import KafkaTimeoutError
-from prometheus_client import Counter, Histogram, Gauge, start_http_server
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
+
+
+def _ensure_shared_module_path(lib_dir: str = "/usr/local/lib/ash") -> None:
+    """Make installed sibling modules importable from the bin launcher.
+
+    ``scripts/install.sh`` puts the executable at ``/usr/local/bin`` and the
+    shared modules (``ash_observability``, ``ash_alerting``) in
+    ``/usr/local/lib/ash``.  Python puts only the script's own directory on
+    ``sys.path``, so without this the installed consumer fails at import
+    with ``ModuleNotFoundError``.  Source checkouts and the container keep
+    the modules beside this file, where the directory already exists on
+    ``sys.path`` and this is a no-op.
+
+    Domain: ``lib_dir`` is an absolute directory path.  A missing directory
+    is ignored; this function never raises.
+    """
+    if os.path.isdir(lib_dir) and lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+
+
+_ensure_shared_module_path()
+
+from ash_observability import (  # noqa: E402
+    FALSE_VALUES,
+    LOG_LEVELS,
+    TRUE_VALUES,
+    configure_logging,
+    log_extra,
+    sd_notify,
+)
 
 # ─── Prometheus Metrics ──────────────────────────────────────────────────────
 EVENTS_RECEIVED = Counter(
@@ -60,7 +98,35 @@ DB_WRITE_LATENCY = Histogram(
     "Database write latency",
     buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
 )
-KAFKA_LAG = Gauge("ash_consumer_kafka_lag", "Kafka consumer lag (estimated)")
+# This is kafka-python's records-lag-max: an estimate from the consumer's
+# last fetched position, not committed-offset lag.  It is still useful for
+# "is the consumer keeping up?", but a DB stall is better detected by the
+# last-successful-flush timestamp and the ready gauge below.
+KAFKA_LAG = Gauge(
+    "ash_consumer_kafka_lag",
+    "Estimated records behind the consumer's last fetched position "
+    "(not committed-offset lag)",
+)
+KAFKA_ASSIGNED_PARTITIONS = Gauge(
+    "ash_consumer_kafka_assigned_partitions",
+    "Number of Kafka partitions currently assigned to this consumer",
+)
+LAST_MESSAGE_TIMESTAMP = Gauge(
+    "ash_consumer_last_message_timestamp_seconds",
+    "Unix timestamp of the last Kafka message received",
+)
+LAST_FLUSH_SUCCESS_TIMESTAMP = Gauge(
+    "ash_consumer_last_flush_success_timestamp_seconds",
+    "Unix timestamp of the last batch persisted to all enabled stores",
+)
+FLUSH_FAILURES = Counter(
+    "ash_consumer_flush_failures_total",
+    "Total batch flushes that left data undurable and pending retry",
+)
+READY = Gauge(
+    "ash_consumer_ready",
+    "1 when the consumer is running, storage is available, and no flush is failing",
+)
 BATCH_SIZE_GAUGE = Gauge("ash_consumer_batch_buffer_size", "Current batch buffer size")
 DB_AVAILABLE = Gauge(
     "ash_consumer_database_available",
@@ -159,6 +225,161 @@ SEVERITY_RISK_SCORE = {
     "low": 2,
 }
 
+_VALID_LOG_LEVELS = LOG_LEVELS
+_TRUE_VALUES = TRUE_VALUES
+_FALSE_VALUES = FALSE_VALUES
+
+
+def _env_bool(name: str, current: bool) -> bool:
+    """Read a boolean environment override.
+
+    Domain: unset -> ``current``; otherwise one of ``1/true/yes/on`` or
+    ``0/false/no/off`` (case-insensitive).  Anything else raises ``ValueError``
+    so a typo cannot silently disable a safety check.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return current
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise ValueError(f"{name} must be one of {_TRUE_VALUES + _FALSE_VALUES}")
+
+
+def _env_int(
+    name: str,
+    current: int,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    """Read an integer environment override.
+
+    Domain: unset -> ``current``; otherwise a base-10 integer within
+    ``[minimum, maximum]`` when those bounds are set.  Invalid input raises
+    ``ValueError`` with the variable name.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return current
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value}")
+    return value
+
+
+def _env_float(name: str, current: float, minimum: Optional[float] = None) -> float:
+    """Read a floating-point environment override.
+
+    Domain: unset -> ``current``; otherwise a finite number >= ``minimum``
+    when set.  NaN and infinity are rejected because they make batch timing
+    and readiness comparisons meaningless.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return current
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"{name} must be finite, got {raw!r}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
+def _env_string(name: str, current: str) -> str:
+    """Read a non-empty string environment override.
+
+    Domain: unset -> ``current``; otherwise a non-empty value after stripping
+    surrounding whitespace.  Empty values raise ``ValueError`` rather than
+    quietly leaving a service pointed at the wrong broker or directory.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return current
+    value = raw.strip()
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return value
+
+
+class _ObservabilityHandler(BaseHTTPRequestHandler):
+    """Serve metrics and health over one small, dependency-free HTTP server.
+
+    The query string is ignored, request paths are not logged, and responses
+    never include exception text or configuration values.  The Prometheus
+    metrics endpoint keeps the conventional ``/metrics`` path so a later
+    scrape configuration does not need a special case.
+    """
+
+    server_version = "ASHObservability/1.0"
+    sys_version = ""
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        path = urlsplit(self.path).path
+        consumer = self.server.consumer  # type: ignore[attr-defined]
+
+        if path == "/metrics":
+            self._send(
+                HTTPStatus.OK,
+                generate_latest(),
+                CONTENT_TYPE_LATEST,
+            )
+            return
+
+        if path == "/health/live":
+            status, payload = consumer.health_liveness()
+        elif path in ("/health", "/health/ready"):
+            status, payload = consumer.health_readiness()
+        else:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "not found"},
+                no_store=True,
+            )
+            return
+
+        self._send_json(status, payload, no_store=True)
+
+    def _send_json(self, status: HTTPStatus, payload: Dict[str, Any], no_store=False):
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self._send(
+            status,
+            body,
+            "application/json; charset=utf-8",
+            no_store=no_store,
+        )
+
+    def _send(
+        self,
+        status: HTTPStatus,
+        body: bytes,
+        content_type: str,
+        no_store: bool = False,
+    ):
+        self.send_response(int(status))
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if no_store:
+            self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        # The default handler writes request lines to stderr without any
+        # redaction or correlation.  Startup/health transitions are logged by
+        # the consumer's structured logger instead.
+        return
+
 
 class ASHConsumer:
     """Production-grade ASH event consumer with resilience patterns."""
@@ -175,6 +396,14 @@ class ASHConsumer:
 
         self._setup_logging()
         self.running = True
+        self._stopping = False
+        self.started_at: float = time.time()
+        self._last_flush_error: Optional[str] = None
+        self._last_flush_success: Optional[float] = None
+        self._last_message_at: Optional[float] = None
+        self._observability_server: Optional[ThreadingHTTPServer] = None
+        self._observability_thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
 
         # Deduplication
         self.seen_event_ids: set = set()
@@ -226,7 +455,8 @@ class ASHConsumer:
             from ash_alerting import ASHAlertEngine
 
             self.alert_engine = ASHAlertEngine(
-                self.config.get("alert_rules_path", "/etc/ash/alert_rules.json")
+                self.config.get("alert_rules_path", "/etc/ash/alert_rules.json"),
+                alert_log_path=str(self.log_dir / "alerts.jsonl"),
             )
 
         # Retention
@@ -234,13 +464,10 @@ class ASHConsumer:
         self.archive_days: int = self.config.get("archive_days", 30)
         self.archive_path = Path(self.config.get("archive_path", "/var/archive/ash"))
 
-        # Metrics server
-        metrics_port = self.config.get("metrics_port", 9090)
-        try:
-            start_http_server(metrics_port)
-            self.logger.info(f"Prometheus metrics server on port {metrics_port}")
-        except Exception as e:
-            self.logger.warning(f"Could not start metrics server: {e}")
+        # Metrics + health endpoint.  Binding is deliberately separate from
+        # Kafka/DB startup: an operator can still see "not ready, DB down"
+        # instead of a connection refused on the health port.
+        self._start_observability_server()
 
         # Signal handlers
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -252,20 +479,160 @@ class ASHConsumer:
         # Start retention maintenance (daily)
         self._start_retention_timer()
 
+        self._refresh_readiness()
+        sd_notify("READY=1")
+        self._start_watchdog()
+
+    def _start_observability_server(self):
+        """Start the combined Prometheus/health HTTP server.
+
+        Domain: ``metrics_host`` is a hostname or IP address (default
+        ``127.0.0.1``); ``metrics_port`` is an integer in 1-65535.  Docker
+        sets the host to ``0.0.0.0`` for an internal-only scrape network;
+        systemd keeps the default loopback bind.
+
+        A bind failure is logged and the consumer keeps processing events.
+        That is intentional: losing observability must not lose data, and
+        the container health check will correctly report the service
+        unhealthy.  The exception text is not included because it can echo
+        the configured address.
+        """
+        host = self.config.get("metrics_host", "127.0.0.1")
+        port = int(self.config.get("metrics_port", 9090))
+        try:
+            server = ThreadingHTTPServer((host, port), _ObservabilityHandler)
+            server.consumer = self  # type: ignore[attr-defined]
+            thread = threading.Thread(
+                target=server.serve_forever,
+                name="ash-observability",
+                daemon=True,
+            )
+            thread.start()
+            self._observability_server = server
+            self._observability_thread = thread
+            self.logger.info(
+                "Observability HTTP server started",
+                extra=log_extra(channel="observability"),
+            )
+        except OSError as exc:
+            self.logger.error(
+                "Could not start observability HTTP server",
+                extra=log_extra(error_type=type(exc).__name__),
+            )
+
+    def _start_watchdog(self):
+        """Send systemd watchdog heartbeats while the process is running.
+
+        Domain: active only when ``NOTIFY_SOCKET`` is set by systemd; the
+        interval is fixed at 10 seconds, below the unit's 60-second
+        ``WatchdogSec``.  This is process liveness, not proof that a Kafka
+        message arrived: an idle consumer is healthy.
+        """
+        if not os.environ.get("NOTIFY_SOCKET"):
+            return
+
+        def heartbeat():
+            while self.running:
+                sd_notify("WATCHDOG=1")
+                time.sleep(10)
+
+        thread = threading.Thread(
+            target=heartbeat, name="ash-systemd-watchdog", daemon=True
+        )
+        thread.start()
+        self._watchdog_thread = thread
+
+    def _is_ready(self) -> bool:
+        """Return whether this consumer can durably accept more events.
+
+        Readiness deliberately does not require recent traffic: an idle
+        consumer whose database and last flush are healthy is ready.  It
+        does require that the last flush did not leave data pending and, if
+        PostgreSQL is enabled, that the database gauge is 1.
+        """
+        if not getattr(self, "running", False):
+            return False
+        if getattr(self, "_last_flush_error", None):
+            return False
+        if self.config.get("database_enabled", False):
+            if DB_AVAILABLE._value.get() != 1:
+                return False
+        return True
+
+    def _refresh_readiness(self):
+        """Publish the readiness decision to the Prometheus gauge."""
+        READY.set(1 if self._is_ready() else 0)
+
+    def health_liveness(self) -> Tuple[HTTPStatus, Dict[str, Any]]:
+        """Return ``(status, body)`` for the liveness endpoint.
+
+        Liveness answers "is this process still running?" and intentionally
+        does not check PostgreSQL or Kafka.  A DB outage must not cause an
+        orchestrator to kill and restart a consumer that is correctly
+        holding its batch.
+        """
+        alive = bool(getattr(self, "running", False)) and not getattr(
+            self, "_stopping", False
+        )
+        status = HTTPStatus.OK if alive else HTTPStatus.SERVICE_UNAVAILABLE
+        return status, {"status": "alive" if alive else "stopping"}
+
+    def health_readiness(self) -> Tuple[HTTPStatus, Dict[str, Any]]:
+        """Return ``(status, body)`` for the readiness endpoint.
+
+        The body is a stable, secret-free summary.  Database error strings,
+        connection URLs, and Kafka broker lists are never included; those
+        belong in the structured logs.
+        """
+        ready = self._is_ready()
+        if self.config.get("database_enabled", False):
+            database = "connected" if DB_AVAILABLE._value.get() == 1 else "unavailable"
+        else:
+            database = "disabled"
+        flush = "ok" if not getattr(self, "_last_flush_error", None) else "failing"
+        last_message = getattr(self, "_last_message_at", None)
+        last_flush = getattr(self, "_last_flush_success", None)
+        started_at = getattr(self, "started_at", time.time())
+        payload = {
+            "status": "ready" if ready else "degraded",
+            "checks": {
+                "consumer": "running" if self.running else "stopping",
+                "database": database,
+                "flush": flush,
+            },
+            "last_message_at": (
+                datetime.fromtimestamp(last_message, tz=timezone.utc).isoformat()
+                if last_message
+                else None
+            ),
+            "last_flush_success_at": (
+                datetime.fromtimestamp(last_flush, tz=timezone.utc).isoformat()
+                if last_flush
+                else None
+            ),
+            "uptime_seconds": round(time.time() - started_at, 3),
+        }
+        status = HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE
+        return status, payload
+
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         default_config = {
             "kafka_brokers": ["localhost:9092"],
             "kafka_topic": "ash-logs",
             "kafka_group_id": "ash-consumer-group",
             "log_dir": "/var/log/ash",
+            "log_level": "INFO",
+            "log_name": "consumer.log",
+            "log_max_bytes": 10 * 1024 * 1024,
+            "log_backup_count": 5,
             "database_enabled": False,
             "database_url": "postgresql://ash:password@localhost/ash_logs",
-            "log_level": "INFO",
             "batch_size": 100,
             "batch_timeout": 5.0,
             "retention_days": 90,
             "archive_days": 30,
             "archive_path": "/var/archive/ash",
+            "metrics_host": "127.0.0.1",
             "metrics_port": 9090,
             "alerting_enabled": False,
             "alert_rules_path": "/etc/ash/alert_rules.json",
@@ -277,21 +644,78 @@ class ASHConsumer:
                 config = json.load(f)
                 default_config.update(config)
 
+        self._apply_environment(default_config)
         return default_config
 
-    def _setup_logging(self):
-        log_level = getattr(logging, self.config.get("log_level", "INFO"))
-        logging.basicConfig(
-            level=log_level,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            handlers=[
-                logging.FileHandler(
-                    str(self.log_dir / "consumer.log"), encoding="utf-8"
-                ),
-                logging.StreamHandler(),
-            ],
+    def _apply_environment(self, config: Dict[str, Any]) -> None:
+        """Apply documented ``ASH_*`` environment overrides in place.
+
+        Docker sets connection details in the environment while the image
+        also ships a JSON config file.  Without this step the JSON file's
+        localhost defaults silently won: the consumer never used the
+        ``ASH_DATABASE_URL``/``ASH_KAFKA_BROKERS`` values passed by Compose.
+
+        Every variable is optional.  Values are validated here and a bad
+        value raises ``ValueError`` before any connection is attempted, so a
+        typo cannot start a consumer that silently writes to the wrong place.
+        See ``docs/OBSERVABILITY.md`` for the full domain table.
+        """
+        if "ASH_KAFKA_BROKERS" in os.environ:
+            raw = _env_string("ASH_KAFKA_BROKERS", "")
+            brokers = [item.strip() for item in raw.split(",") if item.strip()]
+            if not brokers:
+                raise ValueError(
+                    "ASH_KAFKA_BROKERS must contain at least one host:port"
+                )
+            config["kafka_brokers"] = brokers
+
+        config["kafka_topic"] = _env_string("ASH_KAFKA_TOPIC", config["kafka_topic"])
+        config["kafka_group_id"] = _env_string(
+            "ASH_KAFKA_GROUP_ID", config["kafka_group_id"]
         )
-        self.logger = logging.getLogger("ash-consumer")
+        config["database_url"] = _env_string("ASH_DATABASE_URL", config["database_url"])
+        config["database_enabled"] = _env_bool(
+            "ASH_DATABASE_ENABLED", config["database_enabled"]
+        )
+        config["alerting_enabled"] = _env_bool(
+            "ASH_ALERTING_ENABLED", config["alerting_enabled"]
+        )
+        config["log_dir"] = _env_string("ASH_LOG_DIR", config["log_dir"])
+        config["log_level"] = _env_string("ASH_LOG_LEVEL", config["log_level"]).upper()
+        if config["log_level"] not in _VALID_LOG_LEVELS:
+            raise ValueError(
+                f"ASH_LOG_LEVEL must be one of {_VALID_LOG_LEVELS}, "
+                f"got {config['log_level']!r}"
+            )
+        config["log_max_bytes"] = _env_int(
+            "ASH_LOG_MAX_BYTES", config["log_max_bytes"], minimum=0
+        )
+        config["log_backup_count"] = _env_int(
+            "ASH_LOG_BACKUP_COUNT", config["log_backup_count"], minimum=0
+        )
+        config["metrics_host"] = _env_string("ASH_METRICS_HOST", config["metrics_host"])
+        config["metrics_port"] = _env_int(
+            "ASH_METRICS_PORT",
+            config["metrics_port"],
+            minimum=1,
+            maximum=65535,
+        )
+        config["batch_size"] = _env_int(
+            "ASH_BATCH_SIZE", config["batch_size"], minimum=1
+        )
+        config["batch_timeout"] = _env_float(
+            "ASH_BATCH_TIMEOUT", config["batch_timeout"], minimum=0.001
+        )
+
+    def _setup_logging(self):
+        self.logger = configure_logging(
+            "ash-consumer",
+            level=self.config.get("log_level", "INFO"),
+            log_dir=str(self.log_dir),
+            log_name=self.config.get("log_name", "consumer.log"),
+            max_bytes=self.config.get("log_max_bytes", 10 * 1024 * 1024),
+            backup_count=self.config.get("log_backup_count", 5),
+        )
 
     def _setup_database(self):
         max_retries = 3
@@ -301,16 +725,22 @@ class ASHConsumer:
                 self.db_conn.autocommit = False
                 self._create_tables()
                 DB_AVAILABLE.set(1)
+                self._refresh_readiness()
                 self.logger.info("Database connection established")
                 return
             except Exception as e:
                 DB_AVAILABLE.set(0)
-                self.logger.error(f"Database setup attempt {attempt+1} failed: {e}")
+                self._refresh_readiness()
+                self.logger.error(
+                    f"Database setup attempt {attempt+1} failed: {e}",
+                    extra=log_extra(error_type=type(e).__name__),
+                )
                 time.sleep(2**attempt)
 
         self.logger.error("Database setup failed after all retries")
         self.db_conn = None
         DB_AVAILABLE.set(0)
+        self._refresh_readiness()
 
     def _create_tables(self):
         with self.db_conn.cursor() as cursor:
@@ -628,15 +1058,21 @@ class ASHConsumer:
             is_valid, reason = self._validate_event(log_data)
             if not is_valid:
                 self.logger.warning(
-                    f"Invalid event ({reason}): "
-                    f"{log_data.get('event_id', 'unknown')}"
+                    "Invalid event dead-lettered",
+                    extra=log_extra(
+                        event_id=log_data.get("event_id"),
+                        session_id=log_data.get("session_id"),
+                        error_type=reason,
+                    ),
                 )
                 self._write_dead_letter(log_data, reason)
                 return
 
             event_id = log_data.get("event_id", "")
             if self._deduplicate(event_id):
-                self.logger.debug(f"Duplicate event skipped: {event_id}")
+                self.logger.debug(
+                    "Duplicate event skipped", extra=log_extra(event_id=event_id)
+                )
                 return
 
             source = log_data.get("source", "unknown")
@@ -670,7 +1106,16 @@ class ASHConsumer:
                 self._flush_batch()
 
         except Exception as e:
-            self.logger.error(f"Error processing message: {e}", exc_info=True)
+            self.logger.error(
+                "Error processing message",
+                exc_info=True,
+                extra=log_extra(
+                    event_id=(
+                        log_data.get("event_id") if isinstance(log_data, dict) else None
+                    ),
+                    error_type=type(e).__name__,
+                ),
+            )
             EVENTS_FAILED.labels(reason="processing_error").inc()
 
     def _flush_batch(self):
@@ -712,8 +1157,13 @@ class ASHConsumer:
 
             self._write_file_batch(batch)
 
-            self.last_flush = time.time()
+            now = time.time()
+            self.last_flush = now
+            self._last_flush_success = now
+            self._last_flush_error = None
+            LAST_FLUSH_SUCCESS_TIMESTAMP.set(now)
             EVENTS_PROCESSED.inc(len(batch))
+            self._refresh_readiness()
             # Signal the main consumer-loop thread that it's now safe to
             # advance committed Kafka offsets past these events (they are
             # durably in the DB and on disk). Set here so this covers both
@@ -723,7 +1173,16 @@ class ASHConsumer:
             self._commit_pending.set()
 
         except Exception as e:
-            self.logger.error(f"Batch flush failed: {e}")
+            self._last_flush_error = type(e).__name__
+            FLUSH_FAILURES.inc()
+            self.logger.error(
+                "Batch flush failed; batch remains pending",
+                exc_info=True,
+                extra=log_extra(
+                    batch_size=len(batch),
+                    error_type=type(e).__name__,
+                ),
+            )
             # Re-add failed batch for retry. Its offset is deliberately
             # left uncommitted, so PostgreSQL failure blocks progress
             # instead of creating a permanent gap in the API's data.
@@ -732,6 +1191,7 @@ class ASHConsumer:
                 self.batch_raw_texts = raw_texts + self.batch_raw_texts
                 BATCH_SIZE_GAUGE.set(len(self.batch_buffer))
             EVENTS_FAILED.labels(reason="flush_error").inc()
+            self._refresh_readiness()
 
         BATCH_FLUSH_LATENCY.observe(time.time() - start_time)
 
@@ -1096,19 +1556,32 @@ class ASHConsumer:
                 self.db_conn.autocommit = previous_autocommit
 
     def _update_lag(self):
-        """Expose kafka-python's max lag so a blocked DB is visible."""
+        """Publish Kafka position/lag and assignment.
+
+        ``records-lag-max`` is kafka-python's estimate from the consumer's
+        last fetched position, not committed-offset lag.  It is still a
+        useful "keeping up?" signal, but it can look healthy during a DB
+        stall; readiness therefore depends on the last flush outcome, not on
+        this gauge.  Metrics are observability only and must never fail a
+        consume cycle.
+        """
+        try:
+            assignment = self.consumer.assignment()
+            KAFKA_ASSIGNED_PARTITIONS.set(len(assignment) if assignment else 0)
+        except Exception:
+            pass
         try:
             lag = self.consumer.metrics().get("records-lag-max")
             if lag is not None:
                 KAFKA_LAG.set(float(lag))
         except Exception:
-            # Metrics are observability only; never fail a consume cycle.
             pass
 
     def run(self):
         """Main consumer loop."""
         self.logger.info(
-            f"ASH Consumer v2.2 started (topic: {self.config['kafka_topic']})"
+            f"ASH Consumer v2.2 started (topic: {self.config['kafka_topic']})",
+            extra=log_extra(channel="kafka"),
         )
 
         try:
@@ -1116,6 +1589,9 @@ class ASHConsumer:
                 if not self.running:
                     break
 
+                now = time.time()
+                self._last_message_at = now
+                LAST_MESSAGE_TIMESTAMP.set(now)
                 raw_text, event, error = self._decode_message(message.value)
                 with self._processing_lock:
                     if error:
@@ -1152,7 +1628,10 @@ class ASHConsumer:
 
     def _signal_handler(self, signum, frame):
         self.logger.info(f"Received signal {signum}, shutting down...")
+        self._stopping = True
         self.running = False
+        self._refresh_readiness()
+        sd_notify("STOPPING=1")
 
     def _cleanup(self):
         # Take the same lock the flush timer uses: _flush_batch() takes
@@ -1169,6 +1648,12 @@ class ASHConsumer:
                     self._commit_pending.clear()
                 except Exception as e:
                     self.logger.error(f"Final offset commit failed: {e}")
+
+        observability_server = getattr(self, "_observability_server", None)
+        if observability_server is not None:
+            observability_server.shutdown()
+            observability_server.server_close()
+            self._observability_server = None
 
         if hasattr(self, "consumer"):
             self.consumer.close()

@@ -12,8 +12,15 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CONSUMER_PATH = REPO_ROOT / "src" / "consumer" / "ash-consumer.py"
-API_PATH = REPO_ROOT / "src" / "consumer" / "api_server.py"
+CONSUMER_DIR = REPO_ROOT / "src" / "consumer"
+CONSUMER_PATH = CONSUMER_DIR / "ash-consumer.py"
+API_PATH = CONSUMER_DIR / "api_server.py"
+
+# The dashed consumer file and api_server.py both import the sibling
+# ash_observability module.  pytest is invoked from the repository root, so
+# the consumer directory is not on sys.path by default.
+if str(CONSUMER_DIR) not in sys.path:
+    sys.path.insert(0, str(CONSUMER_DIR))
 
 # api_server.py refuses to import without these; tests use throwaway values.
 os.environ.setdefault("ASH_JWT_SECRET", "test-only-jwt-secret-not-for-production")

@@ -1,6 +1,7 @@
 """Degradation tests for the consumer's startup and storage failure paths."""
 
 import json
+import logging
 
 import psycopg2
 from kafka.errors import KafkaTimeoutError
@@ -31,7 +32,7 @@ class _BadWriteConnection:
 def test_database_setup_gives_up_after_retries(consumer_module, monkeypatch):
     consumer = object.__new__(consumer_module.ASHConsumer)
     consumer.config = {"database_url": "postgresql://unreachable"}
-    consumer.logger = consumer_module.logging.getLogger("db-retry-test")
+    consumer.logger = logging.getLogger("db-retry-test")
 
     attempts = []
 
@@ -56,7 +57,7 @@ def test_kafka_setup_exits_after_all_attempts(consumer_module, monkeypatch):
         "kafka_brokers": ["unreachable:9092"],
         "kafka_group_id": "test-group",
     }
-    consumer.logger = consumer_module.logging.getLogger("kafka-retry-test")
+    consumer.logger = logging.getLogger("kafka-retry-test")
 
     attempts = []
 
