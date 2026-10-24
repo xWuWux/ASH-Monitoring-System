@@ -92,6 +92,22 @@ def invalid_request(error):
     return jsonify({"error": error.description}), 400
 
 
+@app.errorhandler(psycopg2.OperationalError)
+def database_unavailable(error):
+    # Connection loss is an expected runtime condition, not a bug. Without
+    # this handler Flask returned its default HTML 500 page, which breaks
+    # JSON clients and hides the retryable nature of the failure. Log the
+    # detail server-side; never echo connection strings to the caller.
+    app.logger.error("Database unavailable: %s", error)
+    return jsonify({"error": "database unavailable"}), 503
+
+
+@app.errorhandler(psycopg2.Error)
+def database_error(error):
+    app.logger.error("Database error: %s", error)
+    return jsonify({"error": "database error"}), 500
+
+
 def _int_arg(name, default, maximum=None, minimum=0):
     """Parse a non-negative integer query parameter.
 
@@ -529,7 +545,10 @@ def verify_integrity():
                 SELECT event_hash, prev_hash, raw_event
                 FROM command_logs
                 WHERE hostname = %s AND event_hash IS NOT NULL
-                ORDER BY log_timestamp
+                -- Chain order is insert order, not wall-clock order: an
+                -- event can arrive late with an earlier timestamp. Ordering
+                -- by log_timestamp reported a false FAIL for such a host.
+                ORDER BY id
             """,
                 (hostname,),
             )

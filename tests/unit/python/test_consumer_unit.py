@@ -3,6 +3,48 @@
 import json
 
 
+def test_constructor_creates_log_dir_before_configuring_logging(
+    consumer_module, tmp_path, monkeypatch
+):
+    """Regression: _setup_logging() used self.log_dir before it was set.
+
+    Every real ``ASHConsumer(...)`` startup raised AttributeError, but the
+    other tests bypass __init__ via object.__new__, so nothing caught it.
+    """
+    log_dir = tmp_path / "log"
+    config_path = tmp_path / "consumer.conf"
+    config_path.write_text(
+        json.dumps(
+            {
+                "log_dir": str(log_dir),
+                "database_enabled": False,
+                "alerting_enabled": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Keep the constructor hermetic: no broker, metrics server, timers, or
+    # process-wide signal handler changes.
+    monkeypatch.setattr(
+        consumer_module.ASHConsumer, "_setup_kafka_consumer", lambda self: None
+    )
+    monkeypatch.setattr(
+        consumer_module.ASHConsumer, "_start_flush_timer", lambda self: None
+    )
+    monkeypatch.setattr(
+        consumer_module.ASHConsumer, "_start_retention_timer", lambda self: None
+    )
+    monkeypatch.setattr(consumer_module, "start_http_server", lambda _port: None)
+    monkeypatch.setattr(consumer_module.signal, "signal", lambda *_args: None)
+
+    consumer = consumer_module.ASHConsumer(str(config_path))
+
+    assert consumer.log_dir == log_dir
+    assert log_dir.is_dir()
+    assert consumer.logger.name == "ash-consumer"
+
+
 def test_process_message_buffers_a_valid_event(consumer_factory, event_factory):
     consumer = consumer_factory()
     event = event_factory()
@@ -102,6 +144,59 @@ def test_flush_without_a_database_is_file_only(consumer_factory, event_factory):
     written = consumer.log_dir / "ash-history-smoke-host.jsonl"
     assert written.exists()
     assert consumer._commit_pending.is_set()
+
+
+def test_retention_vacuums_with_autocommit_and_restores_it(consumer_factory):
+    """VACUUM cannot run in a transaction; it used to fail every run."""
+
+    class FakeCursor:
+        rowcount = 1
+
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, _params=None):
+            self.conn.log.append((sql, self.conn.autocommit))
+
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def __init__(self):
+            self.autocommit = False
+            self.log = []
+
+        def cursor(self, **_kwargs):
+            return FakeCursor(self)
+
+        def commit(self):
+            self.log.append(("COMMIT", self.autocommit))
+
+    consumer = consumer_factory()
+    consumer.archive_days = 30
+    consumer.retention_days = 90
+    connection = FakeConnection()
+    consumer.db_conn = connection
+
+    consumer._run_retention()
+
+    vacuum_entries = [
+        (sql, autocommit)
+        for sql, autocommit in connection.log
+        if isinstance(sql, str) and sql.startswith("VACUUM")
+    ]
+    assert vacuum_entries == [
+        ("VACUUM ANALYZE command_logs", True),
+        ("VACUUM ANALYZE file_changes", True),
+    ]
+    # The connection must go back to manual-commit mode for normal writes.
+    assert connection.autocommit is False
 
 
 def test_dedup_cache_evicts_oldest_entries(consumer_factory):

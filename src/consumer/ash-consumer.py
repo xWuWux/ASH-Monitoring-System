@@ -131,6 +131,14 @@ class ASHConsumer:
 
     def __init__(self, config_path: str = "/etc/ash/consumer.conf"):
         self.config = self._load_config(config_path)
+
+        # _setup_logging() attaches a FileHandler under self.log_dir, so the
+        # directory must exist and the attribute must be set first. It used
+        # to be assigned further down, which made every real startup crash
+        # with AttributeError before the consumer could connect to anything.
+        self.log_dir = Path(self.config.get("log_dir", "/var/log/ash"))
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
         self._setup_logging()
         self.running = True
 
@@ -152,10 +160,7 @@ class ASHConsumer:
         # self.consumer.commit() -- KafkaConsumer is not thread-safe.
         self._commit_pending = threading.Event()
 
-        # Storage
-        self.log_dir = Path(self.config.get("log_dir", "/var/log/ash"))
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-
+        # Storage (log_dir was created before logging was configured)
         # Dead-letter queue: events that fail schema validation were
         # previously logged at WARNING and silently discarded. Route them
         # here instead so nothing is lost without a trace and an operator
@@ -789,10 +794,20 @@ class ASHConsumer:
             )
             self.db_conn.commit()
 
-            if deleted > 0:
-                self.logger.info(f"Deleted {deleted} expired records")
-                cursor.execute("VACUUM ANALYZE command_logs")
-                cursor.execute("VACUUM ANALYZE file_changes")
+        if deleted > 0:
+            self.logger.info(f"Deleted {deleted} expired records")
+            # VACUUM cannot run inside a transaction block. The connection
+            # is in manual-commit mode, so a plain execute() here starts a
+            # new transaction and PostgreSQL rejects it -- the old code
+            # logged deletion, then failed VACUUM on every retention run.
+            previous_autocommit = self.db_conn.autocommit
+            self.db_conn.autocommit = True
+            try:
+                with self.db_conn.cursor() as vacuum_cursor:
+                    vacuum_cursor.execute("VACUUM ANALYZE command_logs")
+                    vacuum_cursor.execute("VACUUM ANALYZE file_changes")
+            finally:
+                self.db_conn.autocommit = previous_autocommit
 
     def run(self):
         """Main consumer loop."""

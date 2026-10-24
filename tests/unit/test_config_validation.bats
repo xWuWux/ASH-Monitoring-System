@@ -77,3 +77,19 @@ run_validate_config() {
     run_validate_config
     [[ $status -ne 0 ]]
 }
+
+@test "validate_config rejects a non-numeric MAX_COMMANDS_PER_SECOND" {
+    # `[[ abc -lt 1 ]]` exits 2, which the old `2>/dev/null` check treated
+    # as a pass -- the bad value then reached arithmetic in the hot path.
+    export MAX_COMMANDS_PER_SECOND=not-a-number
+    run_validate_config
+    [[ $status -ne 0 ]]
+    [[ "$output" == *"MAX_COMMANDS_PER_SECOND"* ]]
+}
+
+@test "validate_config rejects a non-numeric MAX_OUTPUT_SIZE" {
+    export MAX_OUTPUT_SIZE=1M
+    run_validate_config
+    [[ $status -ne 0 ]]
+    [[ "$output" == *"MAX_OUTPUT_SIZE"* ]]
+}

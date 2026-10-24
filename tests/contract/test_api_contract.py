@@ -580,3 +580,80 @@ def test_integrity_verify_contract(api_client, admin_headers, contract_data):
     )
     assert data["status"] == "PASS"
     assert data["events_checked"] == 0
+
+
+def test_integrity_verify_uses_insert_order_not_timestamps(
+    api_client, admin_headers, database_url
+):
+    """A late event can carry an earlier timestamp than its predecessor.
+
+    The chain is built in arrival/insert order, so verifying ORDER BY
+    log_timestamp would see the late event first and report a false FAIL.
+    """
+    import psycopg2
+
+    tag = uuid4().hex[:12]
+    hostname = f"contract-order-{tag}"
+    session_id = str(uuid4())
+    first_event = str(uuid4())
+    second_event = str(uuid4())
+    later = datetime.now(timezone.utc).replace(tzinfo=None)
+    earlier = later - timedelta(hours=1)
+
+    conn = psycopg2.connect(database_url)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO command_logs
+                    (event_id, schema_version, hostname, source, event_type,
+                     username, session_id, command, cwd, exit_code,
+                     log_timestamp, risk_score, prev_hash, event_hash)
+                VALUES (%s, '1.0', %s, 'bash-debug', 'command_start', 'u',
+                        %s, 'late-arrival', '/srv/app', 0, %s, 0, %s, %s),
+                       (%s, '1.0', %s, 'bash-debug', 'command_end', 'u',
+                        %s, 'early-timestamp', '/srv/app', 0, %s, 0, %s, %s)
+                """,
+                (
+                    first_event,
+                    hostname,
+                    session_id,
+                    later,
+                    "0" * 64,
+                    "a" * 64,
+                    second_event,
+                    hostname,
+                    session_id,
+                    earlier,
+                    "a" * 64,
+                    "b" * 64,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        data = body(
+            api_client.post(
+                "/api/v1/integrity/verify",
+                json={"hostname": hostname},
+                headers=admin_headers,
+            )
+        )
+        assert data == {
+            "status": "PASS",
+            "hostname": hostname,
+            "events_checked": 2,
+            "integrity_errors": 0,
+        }
+    finally:
+        conn = psycopg2.connect(database_url)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM command_logs WHERE hostname = %s", (hostname,)
+                )
+            conn.commit()
+        finally:
+            conn.close()

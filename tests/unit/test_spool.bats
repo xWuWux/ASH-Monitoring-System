@@ -73,6 +73,31 @@ sent_count() {
     [[ $status -eq 0 ]]
 }
 
+@test "concurrent spool writes from one parent do not overwrite each other" {
+    # Force every writer to see the same timestamp: without BASHPID in the
+    # filename, background subshells sharing the parent's $$ collide.
+    date() {
+        if [[ "${1:-}" == "+%s%N" ]]; then
+            printf '0\n'
+        else
+            command date "$@"
+        fi
+    }
+
+    local pids=()
+    for i in $(seq 1 20); do
+        (
+            spool_write "{\"event_id\":\"spool-concurrent-$i\"}"
+        ) &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+
+    [[ $(pending_count) -eq 20 ]]
+}
+
 @test "spool_write fails cleanly when the pending directory is missing" {
     rm -rf "$ASH_SPOOL_DIR/pending"
     run spool_write '{"event_id":"spool-2"}'

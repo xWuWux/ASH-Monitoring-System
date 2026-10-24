@@ -145,10 +145,13 @@ missing optional dependencies (`jq`, `inotifywait`), spool-write failures,
 lost database connections, and crash recovery on every CI build.
 `tests/smoke/` runs the agent event pipeline and a real gunicorn API +
 PostgreSQL smoke test, including a 50-concurrent-request p95 latency check.
-`tests/unit/test_events.bats` covers concurrent hash-chain writers and
-subshell temp-file collisions. Still **not automated**: disk-full, OOM-kill,
-network-partition (`tc netem` is unavailable/unreliable on hosted runners),
-and spool-corruption scenarios.
+`tests/integration/kafka-e2e.sh` runs the real wire path on every push/PR:
+the real agent producer → a real Kafka broker → the real Python consumer →
+PostgreSQL, asserting the stored row and both hash fields. It uses no fake
+producer or in-process mock. `tests/unit/test_events.bats` covers concurrent
+hash-chain writers and subshell temp-file collisions. Still **not automated**:
+disk-full, OOM-kill, network-partition (`tc netem` is unavailable/unreliable
+on hosted runners), and spool-corruption scenarios.
 
 ---
 

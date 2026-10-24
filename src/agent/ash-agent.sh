@@ -108,34 +108,38 @@ validate_config() {
         if [[ ! -d "$dir_path" ]]; then
             mkdir -p "$dir_path" 2>/dev/null || {
                 echo "ERROR: Cannot create $dir_var=$dir_path" >&2
-                ((errors++))
+                errors=$((errors + 1))
             }
         fi
         if [[ ! -w "$dir_path" ]]; then
             echo "ERROR: $dir_var=$dir_path is not writable" >&2
-            ((errors++))
+            errors=$((errors + 1))
         fi
     done
 
     if [[ "${KAFKA_ENABLED}" == "true" ]]; then
         if [[ -z "${KAFKA_BROKER:-}" ]]; then
             echo "ERROR: KAFKA_ENABLED=true but KAFKA_BROKER is empty" >&2
-            ((errors++))
+            errors=$((errors + 1))
         fi
         if [[ -z "${KAFKA_TOPIC:-}" ]]; then
             echo "ERROR: KAFKA_ENABLED=true but KAFKA_TOPIC is empty" >&2
-            ((errors++))
+            errors=$((errors + 1))
         fi
     fi
 
-    if [[ "${MAX_COMMANDS_PER_SECOND}" -lt 1 ]] 2>/dev/null; then
-        echo "ERROR: MAX_COMMANDS_PER_SECOND must be >= 1" >&2
-        ((errors++))
+    # Require digits before the numeric comparison: `[[ abc -lt 1 ]]` fails
+    # with status 2, which the old `2>/dev/null` silently treated as "valid".
+    if ! [[ "${MAX_COMMANDS_PER_SECOND}" =~ ^[0-9]+$ ]] ||
+        [[ "${MAX_COMMANDS_PER_SECOND}" -lt 1 ]]; then
+        echo "ERROR: MAX_COMMANDS_PER_SECOND must be an integer >= 1" >&2
+        errors=$((errors + 1))
     fi
 
-    if [[ "${MAX_OUTPUT_SIZE}" -lt 1024 ]] 2>/dev/null; then
-        echo "ERROR: MAX_OUTPUT_SIZE must be >= 1024" >&2
-        ((errors++))
+    if ! [[ "${MAX_OUTPUT_SIZE}" =~ ^[0-9]+$ ]] ||
+        [[ "${MAX_OUTPUT_SIZE}" -lt 1024 ]]; then
+        echo "ERROR: MAX_OUTPUT_SIZE must be an integer >= 1024" >&2
+        errors=$((errors + 1))
     fi
 
     if [[ "${INOTIFY_ENABLED}" == "true" ]] && ! command -v inotifywait >/dev/null 2>&1; then
@@ -167,7 +171,10 @@ safe_log_write() {
 
     (
         flock -x 200
-        cat "$temp_file" >>"$target_file"
+        # `|| exit 1` is required: without it a failed cat is masked by the
+        # successful rm below, the subshell reports success, and the fallback
+        # append is skipped -- silently losing the event.
+        cat "$temp_file" >>"$target_file" || exit 1
         rm -f "$temp_file"
     ) 200>"${target_file}.lock" 2>/dev/null
 
@@ -356,7 +363,7 @@ verify_hash_chain() {
     local errors=0
 
     while IFS= read -r line; do
-        ((line_num++))
+        line_num=$((line_num + 1))
         local stored_hash stored_prev
 
         if command -v jq >/dev/null 2>&1; then
@@ -371,7 +378,7 @@ verify_hash_chain() {
 
         if [[ "$stored_prev" != "$prev_hash" ]]; then
             echo "LINE $line_num: Chain broken — expected prev_hash $prev_hash, got $stored_prev"
-            ((errors++))
+            errors=$((errors + 1))
         fi
 
         # Strip hash fields and recompute
@@ -386,17 +393,19 @@ verify_hash_chain() {
 
         if [[ "$computed" != "$stored_hash" ]]; then
             echo "LINE $line_num: Hash mismatch — content was modified"
-            ((errors++))
+            errors=$((errors + 1))
         fi
         prev_hash="$stored_hash"
     done <"$log_file"
 
     if [[ $errors -eq 0 ]]; then
         echo "PASS: All $line_num entries verified successfully"
-    else
-        echo "FAIL: $errors integrity errors found in $line_num entries"
+        return 0
     fi
-    return $errors
+    echo "FAIL: $errors integrity errors found in $line_num entries"
+    # Do not `return $errors`: shell exit statuses are 0-255, so a log with
+    # exactly 256 (or 512, ...) errors would wrap to 0 and look like a pass.
+    return 1
 }
 
 # ─── Local Spool Queue ───────────────────────────────────────────────────────
@@ -407,7 +416,9 @@ spool_init() {
 
 spool_write() {
     local event_json="$1"
-    local spool_file="${ASH_SPOOL_DIR}/pending/$(date +%s%N)_$$"
+    # BASHPID, not $$: background subshells inherit $$ and two events emitted
+    # in the same nanosecond would otherwise overwrite each other's spool file.
+    local spool_file="${ASH_SPOOL_DIR}/pending/$(date +%s%N)_${BASHPID:-$$}"
     printf '%s\n' "$event_json" >"$spool_file" 2>/dev/null || return 1
 
     # Enforce max spool size
@@ -494,7 +505,10 @@ emit_event() {
     session_id="${ASH_SESSION_ID:-unknown}"
     pid="$$"
     ppid="${PPID:-1}"
-    tty=$(tty 2>/dev/null || echo "unknown")
+    # `tty` prints "not a tty" and exits 1 when stdin is not a terminal.
+    # Assign the fallback instead of appending it, which used to produce a
+    # multi-line "not a tty\nunknown" value in every non-interactive event.
+    tty=$(tty 2>/dev/null) || tty="unknown"
     cwd="${PWD}"
 
     local event
@@ -569,7 +583,10 @@ emit_event() {
         spool_write "$signed_event"
     fi
 
-    ((EVENTS_LOGGED++))
+    # Assignment, not `((EVENTS_LOGGED++))`: post-increment evaluates to the
+    # old value, so the first event made this function return status 1 --
+    # and under `set -e` it aborted the caller after a successful write.
+    EVENTS_LOGGED=$((EVENTS_LOGGED + 1))
 }
 
 # ─── Session Events ���─────────────────────────���──────────────────────────────
