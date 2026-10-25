@@ -4,7 +4,10 @@ After=network.target local-fs.target auditd.service
 Wants=auditd.service
 
 [Service]
-Type=simple
+# Type=notify: the agent sends READY=1 after initialization, then a
+# dedicated helper sends WATCHDOG=1 every ASH_WATCHDOG_INTERVAL seconds
+# (default 10, below the 30s timeout). An idle host no longer looks dead.
+Type=notify
 User=root
 Group=root
 ExecStartPre=/bin/mkdir -p /var/log/ash /var/spool/ash /tmp/ash
@@ -19,6 +22,7 @@ StartLimitIntervalSec=60
 # Watchdog — agent must notify every 30s or systemd restarts it
 WatchdogSec=30
 NotifyAccess=all
+Environment=ASH_WATCHDOG_INTERVAL=10
 
 # Environment
 Environment=ASH_CONFIG_DIR=/etc/ash

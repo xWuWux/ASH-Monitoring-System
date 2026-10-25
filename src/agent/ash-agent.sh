@@ -47,6 +47,9 @@ DOCKER_MONITOR_ENABLED="${DOCKER_MONITOR_ENABLED:-false}"
 MAX_COMMANDS_PER_SECOND="${MAX_COMMANDS_PER_SECOND:-50}"
 MAX_OUTPUT_SIZE="${MAX_OUTPUT_SIZE:-1048576}"
 ASH_SPOOL_MAX_SIZE="${ASH_SPOOL_MAX_SIZE:-1073741824}"
+# Domain: integer seconds >= 1. Must stay comfortably below the unit's
+# WatchdogSec=30 so one missed kick does not trigger a restart.
+ASH_WATCHDOG_INTERVAL="${ASH_WATCHDOG_INTERVAL:-10}"
 
 WATCHED_FILES=(
     "/etc/passwd"
@@ -108,34 +111,44 @@ validate_config() {
         if [[ ! -d "$dir_path" ]]; then
             mkdir -p "$dir_path" 2>/dev/null || {
                 echo "ERROR: Cannot create $dir_var=$dir_path" >&2
-                ((errors++))
+                errors=$((errors + 1))
             }
         fi
         if [[ ! -w "$dir_path" ]]; then
             echo "ERROR: $dir_var=$dir_path is not writable" >&2
-            ((errors++))
+            errors=$((errors + 1))
         fi
     done
 
     if [[ "${KAFKA_ENABLED}" == "true" ]]; then
         if [[ -z "${KAFKA_BROKER:-}" ]]; then
             echo "ERROR: KAFKA_ENABLED=true but KAFKA_BROKER is empty" >&2
-            ((errors++))
+            errors=$((errors + 1))
         fi
         if [[ -z "${KAFKA_TOPIC:-}" ]]; then
             echo "ERROR: KAFKA_ENABLED=true but KAFKA_TOPIC is empty" >&2
-            ((errors++))
+            errors=$((errors + 1))
         fi
     fi
 
-    if [[ "${MAX_COMMANDS_PER_SECOND}" -lt 1 ]] 2>/dev/null; then
-        echo "ERROR: MAX_COMMANDS_PER_SECOND must be >= 1" >&2
-        ((errors++))
+    # Require digits before the numeric comparison: `[[ abc -lt 1 ]]` fails
+    # with status 2, which the old `2>/dev/null` silently treated as "valid".
+    if ! [[ "${MAX_COMMANDS_PER_SECOND}" =~ ^[0-9]+$ ]] ||
+        [[ "${MAX_COMMANDS_PER_SECOND}" -lt 1 ]]; then
+        echo "ERROR: MAX_COMMANDS_PER_SECOND must be an integer >= 1" >&2
+        errors=$((errors + 1))
     fi
 
-    if [[ "${MAX_OUTPUT_SIZE}" -lt 1024 ]] 2>/dev/null; then
-        echo "ERROR: MAX_OUTPUT_SIZE must be >= 1024" >&2
-        ((errors++))
+    if ! [[ "${MAX_OUTPUT_SIZE}" =~ ^[0-9]+$ ]] ||
+        [[ "${MAX_OUTPUT_SIZE}" -lt 1024 ]]; then
+        echo "ERROR: MAX_OUTPUT_SIZE must be an integer >= 1024" >&2
+        errors=$((errors + 1))
+    fi
+
+    if ! [[ "${ASH_WATCHDOG_INTERVAL}" =~ ^[0-9]+$ ]] ||
+        [[ "${ASH_WATCHDOG_INTERVAL}" -lt 1 ]]; then
+        echo "ERROR: ASH_WATCHDOG_INTERVAL must be an integer >= 1" >&2
+        errors=$((errors + 1))
     fi
 
     if [[ "${INOTIFY_ENABLED}" == "true" ]] && ! command -v inotifywait >/dev/null 2>&1; then
@@ -158,13 +171,19 @@ validate_config() {
 safe_log_write() {
     local content="$1"
     local target_file="${2:-${ASH_EVENTS_FILE}}"
-    local temp_file="${ASH_TEMP_DIR}/write.$$.tmp"
+    # BASHPID, not $$: background subshells and command substitutions share
+    # the parent's $$, so two concurrent writers could pick the same temp
+    # path and one would truncate the other's content before it was appended.
+    local temp_file="${ASH_TEMP_DIR}/write.${BASHPID:-$$}.tmp"
 
     printf '%s\n' "$content" >"$temp_file" 2>/dev/null || return 1
 
     (
         flock -x 200
-        cat "$temp_file" >>"$target_file"
+        # `|| exit 1` is required: without it a failed cat is masked by the
+        # successful rm below, the subshell reports success, and the fallback
+        # append is skipped -- silently losing the event.
+        cat "$temp_file" >>"$target_file" || exit 1
         rm -f "$temp_file"
     ) 200>"${target_file}.lock" 2>/dev/null
 
@@ -279,17 +298,32 @@ redact_sensitive_data() {
 # ─── Hash-Chained Append-Only Logs ─────────────────────────────��────────────
 hash_chain_init() {
     if [[ ! -f "${ASH_HASH_FILE}" ]]; then
-        echo "0000000000000000000000000000000000000000000000000000000000000000" >"${ASH_HASH_FILE}"
-        # 600, not 400: hash_chain_append() must keep appending to this file
-        # for the life of the process. 400 (no write bit, even for the
-        # owner) blocks that on every non-root run and only ever "worked"
-        # because DAC checks don't apply to root, which is how this agent
-        # has always been deployed so far (see deployments/systemd/*).
-        chmod 600 "${ASH_HASH_FILE}" 2>/dev/null || true
+        (
+            # Two sessions can start at the same time on a host that has
+            # never run ASH. Without the lock both can see the missing file
+            # and one can truncate the genesis value the other just wrote.
+            exec {lock_fd}>"${ASH_HASH_FILE}.lock"
+            flock -x "$lock_fd"
+            if [[ ! -f "${ASH_HASH_FILE}" ]]; then
+                echo "0000000000000000000000000000000000000000000000000000000000000000" >"${ASH_HASH_FILE}"
+                # 600, not 400: hash_chain_append() must keep appending to this
+                # file for the life of the process. 400 (no write bit, even for
+                # the owner) blocks that on every non-root run and only ever
+                # "worked" because DAC checks don't apply to root, which is how
+                # this agent has always been deployed so far (see
+                # deployments/systemd/*).
+                chmod 600 "${ASH_HASH_FILE}" 2>/dev/null || true
+            fi
+        )
     fi
 }
 
-hash_chain_append() {
+# Read the last hash, sign the event, and append the new hash to the chain
+# file. Callers must hold the ${ASH_HASH_FILE}.lock that hash_chain_append()
+# and emit_event() take. Keeping this separate lets emit_event() hold one lock
+# across both the hash append and the event-log append, so the two files stay
+# in the same order.
+_hash_chain_append_unlocked() {
     local event_json="$1"
     local prev_hash
     # Re-read the file on every call rather than caching the last hash in a
@@ -319,6 +353,18 @@ hash_chain_append() {
     echo "$signed_event"
 }
 
+hash_chain_append() {
+    (
+        # Re-reading the file is not enough on its own: two sessions can
+        # both read the same prev_hash before either appends, producing two
+        # events that fork the chain. Serialize the read/compute/append
+        # sequence across every process sharing this host's chain.
+        exec {lock_fd}>"${ASH_HASH_FILE}.lock"
+        flock -x "$lock_fd"
+        _hash_chain_append_unlocked "$1"
+    )
+}
+
 verify_hash_chain() {
     local log_file="${1:-${ASH_EVENTS_FILE}}"
     local prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
@@ -326,7 +372,7 @@ verify_hash_chain() {
     local errors=0
 
     while IFS= read -r line; do
-        ((line_num++))
+        line_num=$((line_num + 1))
         local stored_hash stored_prev
 
         if command -v jq >/dev/null 2>&1; then
@@ -341,7 +387,7 @@ verify_hash_chain() {
 
         if [[ "$stored_prev" != "$prev_hash" ]]; then
             echo "LINE $line_num: Chain broken — expected prev_hash $prev_hash, got $stored_prev"
-            ((errors++))
+            errors=$((errors + 1))
         fi
 
         # Strip hash fields and recompute
@@ -356,17 +402,19 @@ verify_hash_chain() {
 
         if [[ "$computed" != "$stored_hash" ]]; then
             echo "LINE $line_num: Hash mismatch — content was modified"
-            ((errors++))
+            errors=$((errors + 1))
         fi
         prev_hash="$stored_hash"
     done <"$log_file"
 
     if [[ $errors -eq 0 ]]; then
         echo "PASS: All $line_num entries verified successfully"
-    else
-        echo "FAIL: $errors integrity errors found in $line_num entries"
+        return 0
     fi
-    return $errors
+    echo "FAIL: $errors integrity errors found in $line_num entries"
+    # Do not `return $errors`: shell exit statuses are 0-255, so a log with
+    # exactly 256 (or 512, ...) errors would wrap to 0 and look like a pass.
+    return 1
 }
 
 # ─── Local Spool Queue ───────────────────────────────────────────────────────
@@ -377,7 +425,9 @@ spool_init() {
 
 spool_write() {
     local event_json="$1"
-    local spool_file="${ASH_SPOOL_DIR}/pending/$(date +%s%N)_$$"
+    # BASHPID, not $$: background subshells inherit $$ and two events emitted
+    # in the same nanosecond would otherwise overwrite each other's spool file.
+    local spool_file="${ASH_SPOOL_DIR}/pending/$(date +%s%N)_${BASHPID:-$$}"
     printf '%s\n' "$event_json" >"$spool_file" 2>/dev/null || return 1
 
     # Enforce max spool size
@@ -424,9 +474,19 @@ send_to_kafka_raw() {
     local message="$1"
     local max_retries=3
     local retry=0
+    local -a producer=(kafka-console-producer.sh)
+    local send_timeout="${KAFKA_SEND_TIMEOUT:-10}"
+
+    # A producer that connects but never returns (broker accepts the TCP
+    # connection and then stops responding) would otherwise block spool_flush
+    # forever: the retry loop never advances because the command never exits.
+    # timeout(1) turns that hang into an ordinary failed attempt.
+    if command -v timeout >/dev/null 2>&1; then
+        producer=(timeout "${send_timeout}" kafka-console-producer.sh)
+    fi
 
     while [[ $retry -lt $max_retries ]]; do
-        if printf '%s\n' "$message" | kafka-console-producer.sh \
+        if printf '%s\n' "$message" | "${producer[@]}" \
             --broker-list "${KAFKA_BROKER}" \
             --topic "${KAFKA_TOPIC}" \
             --request-required-acks 1 \
@@ -454,7 +514,10 @@ emit_event() {
     session_id="${ASH_SESSION_ID:-unknown}"
     pid="$$"
     ppid="${PPID:-1}"
-    tty=$(tty 2>/dev/null || echo "unknown")
+    # `tty` prints "not a tty" and exits 1 when stdin is not a terminal.
+    # Assign the fallback instead of appending it, which used to produce a
+    # multi-line "not a tty\nunknown" value in every non-interactive event.
+    tty=$(tty 2>/dev/null) || tty="unknown"
     cwd="${PWD}"
 
     local event
@@ -511,19 +574,28 @@ emit_event() {
         fi
     fi
 
-    # Hash chain signing
-    local signed_event
-    signed_event=$(hash_chain_append "$event")
-
-    # Write to local events log
+    # Hash chain signing and the event-log append must happen under the same
+    # lock. Taking the lock inside hash_chain_append() alone keeps the hash
+    # file consistent, but releases it before safe_log_write() runs, so two
+    # sessions can append their hashes in one order and their events in the
+    # other, breaking verify_hash_chain() even though every hash is correct.
+    local signed_event lock_fd
+    exec {lock_fd}>"${ASH_HASH_FILE}.lock"
+    flock -x "$lock_fd"
+    signed_event=$(_hash_chain_append_unlocked "$event")
     safe_log_write "$signed_event"
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
 
     # Forward to Kafka spool
     if [[ "${KAFKA_ENABLED}" == "true" ]]; then
         spool_write "$signed_event"
     fi
 
-    ((EVENTS_LOGGED++))
+    # Assignment, not `((EVENTS_LOGGED++))`: post-increment evaluates to the
+    # old value, so the first event made this function return status 1 --
+    # and under `set -e` it aborted the caller after a successful write.
+    EVENTS_LOGGED=$((EVENTS_LOGGED + 1))
 }
 
 # ─── Session Events ���─────────────────────────���──────────────────────────────
@@ -771,9 +843,6 @@ _log_command_body() {
         fi
         emit_event "privilege_escalation" "$priv_extra"
     fi
-
-    # Systemd watchdog kick
-    systemd-notify WATCHDOG=1 2>/dev/null || true
 }
 
 # ─── PROMPT_COMMAND Integration ──────────────────────────────────────────────
@@ -950,23 +1019,27 @@ recover_state() {
     rm -f "${ASH_STATE_FILE}"
 }
 
-# ─── Prometheus Metrics ──────────────────────────────────────────────────────
-write_prometheus_metrics() {
-    local metrics_file="${ASH_TEMP_DIR}/ash_metrics.prom"
-    cat >"$metrics_file" <<EOF
-# HELP ash_agent_events_total Total events logged by ASH agent
-# TYPE ash_agent_events_total counter
-ash_agent_events_total ${EVENTS_LOGGED:-0}
-# HELP ash_agent_spool_pending Pending events in spool queue
-# TYPE ash_agent_spool_pending gauge
-ash_agent_spool_pending $(ls "${ASH_SPOOL_DIR}/pending/" 2>/dev/null | wc -l)
-# HELP ash_agent_uptime_seconds Agent uptime in seconds
-# TYPE ash_agent_uptime_seconds gauge
-ash_agent_uptime_seconds $(($(date +%s) - ASH_START_TIME))
-# HELP ash_agent_info Agent version and metadata
-# TYPE ash_agent_info gauge
-ash_agent_info{version="${ASH_VERSION}",hostname="$(hostname)"} 1
-EOF
+# ─── systemd Watchdog ───────────────────────────────────────────────────────
+# The old implementation called systemd-notify only from log_command(), so a
+# host that went idle for WatchdogSec was restarted by systemd even though
+# the agent was healthy.  A dedicated heartbeat is independent of traffic.
+watchdog_kick() {
+    [[ -z "${NOTIFY_SOCKET:-}" ]] && return 0
+    systemd-notify WATCHDOG=1 2>/dev/null || true
+}
+
+start_watchdog() {
+    [[ -z "${NOTIFY_SOCKET:-}" ]] && return 0
+    # Type=notify waits for this; NotifyAccess=all in the unit allows the
+    # helper process to send it.
+    systemd-notify --ready 2>/dev/null || true
+    (
+        while true; do
+            watchdog_kick
+            sleep "${ASH_WATCHDOG_INTERVAL}"
+        done
+    ) &
+    echo "$!" >"${ASH_TEMP_DIR}/watchdog.pid"
 }
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
@@ -1023,6 +1096,9 @@ main() {
 
     # Emit session start
     emit_session_start
+
+    # Start the systemd liveness heartbeat (no-op outside systemd).
+    start_watchdog
 
     # Set up command trapping
     trap 'log_command' DEBUG

@@ -1,8 +1,18 @@
 version: '3.8'
 
+# Every container's stdout is JSON where the service emits it, but Docker's
+# json-file driver is otherwise unbounded.  Cap each service so one noisy
+# incident cannot fill the host disk.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
+    logging: *default-logging
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -14,6 +24,7 @@ services:
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
+    logging: *default-logging
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -35,6 +46,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    logging: *default-logging
     environment:
       POSTGRES_DB: ash_logs
       POSTGRES_USER: ash
@@ -58,15 +70,32 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    logging: *default-logging
     environment:
       ASH_DATABASE_URL: postgresql://ash:${ASH_DB_PASSWORD:?Set ASH_DB_PASSWORD (see .env.example) — no default is provided}@postgres/ash_logs
       ASH_KAFKA_BROKERS: kafka:29092
+      # The health/metrics listener is reachable only on the Compose
+      # network; port 9090 is not published to the host.
+      ASH_METRICS_HOST: "0.0.0.0"
+      ASH_LOG_LEVEL: ${ASH_LOG_LEVEL:-INFO}
     volumes:
       - ash_logs:/var/log/ash
       - ash_archive:/var/archive/ash
     restart: unless-stopped
+    # The shutdown flush can retry PostgreSQL (3 attempts with connect
+    # timeouts and backoff); 30s was shorter than that worst case.
+    stop_grace_period: 60s
     healthcheck:
-      test: ["CMD", "python3", "-c", "import requests; r=requests.get('http://localhost:9090'); assert r.status_code==200"]
+      # Readiness, not the old "port 9090 accepted a connection" check:
+      # this returns 503 while PostgreSQL is unavailable or a flush is
+      # still pending, so a wedged consumer cannot look healthy.
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:9090/health/ready')",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -78,6 +107,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    logging: *default-logging
     ports:
       - "8080:8080"
     environment:
@@ -86,9 +116,17 @@ services:
       ASH_ADMIN_USER: ${ASH_ADMIN_USER:?Set ASH_ADMIN_USER (see .env.example) — no default is provided}
       ASH_ADMIN_PASS: ${ASH_ADMIN_PASS:?Set ASH_ADMIN_PASS (see .env.example) — the old default was the publicly-known literal "admin"}
       ASH_API_PORT: "8080"
+      ASH_LOG_LEVEL: ${ASH_LOG_LEVEL:-INFO}
+      # /metrics stays off until the monitoring stack (PR 3) sets both
+      # values. It is fail-closed: enabled without a token returns 401.
+      ASH_METRICS_ENABLED: ${ASH_METRICS_ENABLED:-false}
+      ASH_METRICS_TOKEN: ${ASH_METRICS_TOKEN:-}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      # python:3.12-slim does not ship curl; use the interpreter the image
+      # already has. Readiness checks PostgreSQL, so the expected 503 during
+      # a database outage marks the container unhealthy instead of hiding it.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
       interval: 10s
       timeout: 3s
       retries: 3

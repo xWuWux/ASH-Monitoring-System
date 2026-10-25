@@ -139,7 +139,23 @@ The roadmap calls for testing:
 - Filesystem corruption of spool directory
 - OOM kill of agent process
 
-**Current state**: Spool queue and retry logic handle most of these gracefully, but no automated chaos tests verify it.
+**Current state**: `tests/degradation/` now covers Kafka outages, a producer
+that hangs after accepting the connection (bounded by `KAFKA_SEND_TIMEOUT`),
+missing optional dependencies (`jq`, `inotifywait`), spool-write failures,
+lost database connections, and crash recovery on every CI build.
+`tests/smoke/` runs the agent event pipeline and a real gunicorn API +
+PostgreSQL smoke test, including a 50-concurrent-request p95 latency check.
+`tests/integration/kafka-e2e.sh` runs the real wire path on every push/PR:
+the real agent producer → a real Kafka broker → the real Python consumer →
+PostgreSQL, asserting the stored row, both hash fields, `raw_event_text`, and
+a hash recomputed from the exact stored line. It uses no fake producer or
+in-process mock. The consumer's database-outage path is covered by
+degradation tests: the batch is retained, the Kafka offset is not committed,
+the local JSONL is not written, and `ash_consumer_database_available` drops
+to 0. `tests/unit/test_events.bats` covers concurrent
+hash-chain writers and subshell temp-file collisions. Still **not automated**:
+disk-full, OOM-kill, network-partition (`tc netem` is unavailable/unreliable
+on hosted runners), and spool-corruption scenarios.
 
 ---
 

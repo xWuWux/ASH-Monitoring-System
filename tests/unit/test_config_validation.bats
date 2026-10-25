@@ -18,6 +18,7 @@ setup() {
     export INOTIFY_ENABLED=false
     export MAX_COMMANDS_PER_SECOND=50
     export MAX_OUTPUT_SIZE=1048576
+    export ASH_WATCHDOG_INTERVAL=10
 }
 
 teardown() {
@@ -55,7 +56,11 @@ run_validate_config() {
 }
 
 @test "validate_config fails with unwritable log dir" {
-    export ASH_LOG_DIR="/nonexistent/path/that/cannot/be/created"
+    # A path whose parent is a regular file fails even when the suite runs as
+    # root, unlike an unwritable directory (root bypasses permission bits).
+    local blocker="${BATS_TEST_TMPDIR}/not-a-directory"
+    : >"$blocker"
+    export ASH_LOG_DIR="${blocker}/logs"
     run_validate_config
     [[ $status -ne 0 ]]
 }
@@ -72,4 +77,27 @@ run_validate_config() {
     export MAX_COMMANDS_PER_SECOND=0
     run_validate_config
     [[ $status -ne 0 ]]
+}
+
+@test "validate_config rejects a non-numeric MAX_COMMANDS_PER_SECOND" {
+    # `[[ abc -lt 1 ]]` exits 2, which the old `2>/dev/null` check treated
+    # as a pass -- the bad value then reached arithmetic in the hot path.
+    export MAX_COMMANDS_PER_SECOND=not-a-number
+    run_validate_config
+    [[ $status -ne 0 ]]
+    [[ "$output" == *"MAX_COMMANDS_PER_SECOND"* ]]
+}
+
+@test "validate_config rejects a non-numeric MAX_OUTPUT_SIZE" {
+    export MAX_OUTPUT_SIZE=1M
+    run_validate_config
+    [[ $status -ne 0 ]]
+    [[ "$output" == *"MAX_OUTPUT_SIZE"* ]]
+}
+
+@test "validate_config rejects a non-positive ASH_WATCHDOG_INTERVAL" {
+    export ASH_WATCHDOG_INTERVAL=0
+    run_validate_config
+    [[ $status -ne 0 ]]
+    [[ "$output" == *"ASH_WATCHDOG_INTERVAL"* ]]
 }

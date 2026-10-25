@@ -8,6 +8,9 @@ Thumbs.db
 secrets.conf
 __pycache__/
 *.pyc
+.pytest_cache/
+coverage.xml
+.coverage
 venv/
 .idea/
 .vscode/

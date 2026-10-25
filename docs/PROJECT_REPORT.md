@@ -44,7 +44,7 @@ Monitored Servers                          Central Server
 │ • Local spool queue │                    │                      │
 └─────────────────────┘                    │ PostgreSQL + JSONL   │
                                            │ REST API (:8080)     │
-                                           │ Prometheus (:9090)   │
+                                           │ Health+metrics(:9090)│
                                            └──────────────────────┘
 ```
 
@@ -111,7 +111,7 @@ Monitored Servers                          Central Server
 
 | Fix ID | Description | Status |
 |--------|-------------|--------|
-| FL-17 | Prometheus metrics | ✅ Implemented (agent + consumer) |
+| FL-17 | Prometheus metrics | ✅ Consumer metrics + opt-in, token-protected API metrics. Agent keeps local JSONL only; no agent scrape endpoint. |
 | FL-18 | RBAC + JWT authentication | ✅ Implemented |
 | FL-19 | Alerting engine | ✅ Implemented |
 | FL-20 | REST API (search, sessions, analytics) | ✅ API implemented, no frontend |
@@ -142,7 +142,7 @@ Monitored Servers                          Central Server
 | Security alerting (MITRE ATT&CK) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Credential redaction | ✅ | ❌ | ❌ | ❌ | ❌ |
 | REST API + RBAC | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Prometheus metrics | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Prometheus metrics | ✅ Consumer + opt-in API | ❌ | ❌ | ❌ | ❌ |
 | Crash recovery | ✅ | ✅ | ❌ | ❌ | ❌ |
 | Interactive TUI/fuzzy search | ❌ | ✅ | ✅ | ✅ | Web |
 
@@ -219,7 +219,7 @@ Documented in detail at `docs/REMAINING_GAPS.md`. Key items:
 | Queue | Apache Kafka | Reliable distributed transport |
 | Storage | PostgreSQL 15+ | Indexed event storage + search |
 | API | Python 3.10+ / Flask | REST endpoints + RBAC |
-| Metrics | Prometheus | Operational observability |
+| Metrics | Prometheus | Consumer metrics; opt-in API metrics (no tracing yet) |
 | Alerting | Custom engine | MITRE ATT&CK rule matching |
 | CI/CD | GitHub Actions | Automated lint, test, build |
 | Container | Docker Compose | Full-stack deployment |
@@ -238,7 +238,7 @@ Documented in detail at `docs/REMAINING_GAPS.md`. Key items:
 | RBAC | admin / analyst / readonly roles |
 | Least privilege | Dedicated `ash` system user for consumer |
 | Threat detection | 12 built-in rules mapped to MITRE ATT&CK |
-| Watchdog | systemd WatchdogSec=30 auto-restart |
+| Watchdog | systemd `Type=notify` + `WatchdogSec`; agent heartbeat is independent of command traffic |
 
 ---
 

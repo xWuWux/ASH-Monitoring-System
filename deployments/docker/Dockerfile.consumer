@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+# Unbuffered stdout means a JSON line is visible to Docker/systemd even if
+# the process is killed before Python's buffered writer flushes.
+ENV PYTHONUNBUFFERED=1
+
 RUN useradd -r -u 1000 -s /bin/false ash && \
     mkdir -p /var/log/ash /var/archive/ash /etc/ash && \
     chown -R ash:ash /var/log/ash /var/archive/ash
