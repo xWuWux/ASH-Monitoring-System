@@ -77,6 +77,15 @@ fi
 ASH_SSH_CONNECTION="${SSH_CONNECTION:-none}"
 ASH_SSH_TTY="${SSH_TTY:-none}"
 
+# ─── W3C Trace Context ───────────────────────────────────────────────────────
+# The agent deliberately does not run an OpenTelemetry SDK. It emits the two
+# IDs from a W3C traceparent (16-byte trace-id, 8-byte span-id) and the
+# consumer reconstructs the spans. All IDs are lowercase hex.
+ASH_CURRENT_TRACE_ID=""
+ASH_LAST_COMMAND_TRACE_ID=""
+ASH_LAST_COMMAND_SPAN_ID=""
+ASH_LAST_EVENT_SPAN_ID=""
+
 # ─── Load Configuration ───────���──────────────────────────────────────────────
 [[ -f "${ASH_CONFIG_DIR}/ash.conf" ]] && source "${ASH_CONFIG_DIR}/ash.conf"
 
@@ -499,6 +508,40 @@ send_to_kafka_raw() {
     return 1
 }
 
+# ─── W3C Trace Identifier Generation ────────────────────────────────────────
+# Domains: trace_id is 32 lowercase hex characters, span_id and parent_span_id
+# are 16 lowercase hex characters. A UUID supplies 128 random bits; od is the
+# fallback when /proc and uuidgen are unavailable. Neither function returns an
+# all-zero value in practice, and the consumer rejects one if it ever occurs.
+new_trace_id() {
+    local value=""
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        value=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
+    elif command -v uuidgen >/dev/null 2>&1; then
+        value=$(uuidgen 2>/dev/null || true)
+    fi
+    if [[ -n "$value" ]]; then
+        printf '%s' "${value//-/}" | tr 'A-F' 'a-f'
+        return 0
+    fi
+    od -An -N16 -tx1 /dev/urandom | tr -d ' \n' | tr 'A-F' 'a-f'
+}
+
+new_span_id() {
+    local value=""
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        value=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
+    elif command -v uuidgen >/dev/null 2>&1; then
+        value=$(uuidgen 2>/dev/null || true)
+    fi
+    if [[ -n "$value" ]]; then
+        value="${value//-/}"
+        printf '%s' "${value:0:16}" | tr 'A-F' 'a-f'
+        return 0
+    fi
+    od -An -N8 -tx1 /dev/urandom | tr -d ' \n' | tr 'A-F' 'a-f'
+}
+
 # ─── Structured Event Emission ───��───────────────────────────────────────────
 emit_event() {
     local event_type="$1"
@@ -506,6 +549,7 @@ emit_event() {
     local extra_fields="${1:-}"
 
     local event_id timestamp hostname user uid session_id pid ppid tty cwd
+    local trace_id span_id
     event_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$$-$(date +%s%N)")
     timestamp=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
     hostname=$(hostname)
@@ -519,6 +563,11 @@ emit_event() {
     # multi-line "not a tty\nunknown" value in every non-interactive event.
     tty=$(tty 2>/dev/null) || tty="unknown"
     cwd="${PWD}"
+    trace_id="${ASH_CURRENT_TRACE_ID}"
+    if [[ -z "$trace_id" ]]; then
+        trace_id=$(new_trace_id)
+    fi
+    span_id=$(new_span_id)
 
     local event
     if command -v jq >/dev/null 2>&1; then
@@ -537,6 +586,8 @@ emit_event() {
             --arg tty "$tty" \
             --arg cwd "$cwd" \
             --arg ssh "$ASH_SSH_CONNECTION" \
+            --arg tid "$trace_id" \
+            --arg spid "$span_id" \
             '{
                 event_id: $eid,
                 schema_version: $sv,
@@ -551,7 +602,9 @@ emit_event() {
                 ppid: $ppid,
                 tty: $tty,
                 cwd: $cwd,
-                ssh_connection: $ssh
+                ssh_connection: $ssh,
+                trace_id: $tid,
+                span_id: $spid
             }')
 
         # Merge extra fields if provided
@@ -559,7 +612,7 @@ emit_event() {
             event=$(echo "$event" | jq -c --argjson extra "$extra_fields" '. + $extra')
         fi
     else
-        event="{\"event_id\":\"$event_id\",\"schema_version\":\"1.0\",\"timestamp\":\"$timestamp\",\"hostname\":\"$hostname\",\"source\":\"bash-debug\",\"event_type\":\"$event_type\",\"user\":\"$user\",\"uid\":$uid,\"session_id\":\"$session_id\",\"pid\":$pid,\"ppid\":$ppid,\"tty\":\"$tty\",\"cwd\":\"$cwd\",\"ssh_connection\":\"$ASH_SSH_CONNECTION\"}"
+        event="{\"event_id\":\"$event_id\",\"schema_version\":\"1.0\",\"timestamp\":\"$timestamp\",\"hostname\":\"$hostname\",\"source\":\"bash-debug\",\"event_type\":\"$event_type\",\"user\":\"$user\",\"uid\":$uid,\"session_id\":\"$session_id\",\"pid\":$pid,\"ppid\":$ppid,\"tty\":\"$tty\",\"cwd\":\"$cwd\",\"ssh_connection\":\"$ASH_SSH_CONNECTION\",\"trace_id\":\"$trace_id\",\"span_id\":\"$span_id\"}"
 
         # Merge extra fields (non-jq fallback). Without this, every
         # event-specific field built by callers (command, file_path,
@@ -573,6 +626,10 @@ emit_event() {
             event="${event%\}},${extra_fields#\{}"
         fi
     fi
+
+    # Callers that emit a related span (privilege escalation, command_end,
+    # file changes) use this as parent_span_id.
+    ASH_LAST_EVENT_SPAN_ID="$span_id"
 
     # Hash chain signing and the event-log append must happen under the same
     # lock. Taking the lock inside hash_chain_append() alone keeps the hash
@@ -709,6 +766,12 @@ check_pending_file_changes() {
     # command_start events.
     cmd=$(redact_sensitive_data "$cmd")
 
+    # File changes detected at the next prompt belong to the command that
+    # caused them, not to a new trace.
+    if [[ -n "$ASH_LAST_COMMAND_TRACE_ID" ]]; then
+        ASH_CURRENT_TRACE_ID="$ASH_LAST_COMMAND_TRACE_ID"
+    fi
+
     for entry in "${ASH_PENDING_SNAPSHOTS[@]:-}"; do
         [[ -z "$entry" ]] && continue
         local file_path="${entry%%|*}"
@@ -728,6 +791,8 @@ check_pending_file_changes() {
         rm -f "${snapshot}"
     done
     ASH_PENDING_SNAPSHOTS=()
+    # File events have been emitted; later events are not part of this trace.
+    ASH_CURRENT_TRACE_ID=""
 }
 
 emit_file_event() {
@@ -743,11 +808,17 @@ emit_file_event() {
             --arg cmd "$command" \
             --arg fp "$file_path" \
             --arg dc "$diff_content" \
-            '{command: $cmd, file_path: $fp, diff_content: $dc, source: "bash-diff"}')
+            --arg pspid "$ASH_LAST_COMMAND_SPAN_ID" \
+            '{command: $cmd, file_path: $fp, diff_content: $dc, source: "bash-diff"} +
+             (if $pspid == "" then {} else {parent_span_id: $pspid} end)')
     else
         local escaped_diff
         escaped_diff=$(echo "$diff_content" | head -c 1024 | tr '\n' ' ' | sed 's/"/\\"/g')
-        extra="{\"command\":\"$command\",\"file_path\":\"$file_path\",\"diff_content\":\"$escaped_diff\",\"source\":\"bash-diff\"}"
+        extra="{\"command\":\"$command\",\"file_path\":\"$file_path\",\"diff_content\":\"$escaped_diff\",\"source\":\"bash-diff\""
+        if [[ -n "$ASH_LAST_COMMAND_SPAN_ID" ]]; then
+            extra+=",\"parent_span_id\":\"$ASH_LAST_COMMAND_SPAN_ID\""
+        fi
+        extra+="}"
     fi
     emit_event "$event_type" "$extra"
 }
@@ -777,6 +848,10 @@ log_command() {
     # Track potential file changes
     track_file_changes "${BASH_COMMAND}"
 
+    # A command gets one trace. command_start is its root span; related
+    # privilege/file events and a failing command_end are children.
+    ASH_CURRENT_TRACE_ID=$(new_trace_id)
+
     # Build extra fields
     local extra
     if command -v jq >/dev/null 2>&1; then
@@ -790,17 +865,27 @@ log_command() {
     fi
 
     emit_event "command_start" "$extra"
+    ASH_LAST_COMMAND_TRACE_ID="$ASH_CURRENT_TRACE_ID"
+    ASH_LAST_COMMAND_SPAN_ID="$ASH_LAST_EVENT_SPAN_ID"
 
     # Privilege escalation detection
     if [[ "${BASH_COMMAND}" =~ ^(sudo|su|doas)[[:space:]] ]]; then
         local priv_extra
         if command -v jq >/dev/null 2>&1; then
-            priv_extra=$(jq -n -c --arg cmd "$cmd" '{command: $cmd, risk_flag: "privilege_escalation"}')
+            priv_extra=$(jq -n -c \
+                --arg cmd "$cmd" \
+                --arg pspid "$ASH_LAST_COMMAND_SPAN_ID" \
+                '{command: $cmd, risk_flag: "privilege_escalation", parent_span_id: $pspid}')
         else
-            priv_extra="{\"command\":\"$cmd\",\"risk_flag\":\"privilege_escalation\"}"
+            priv_extra="{\"command\":\"$cmd\",\"risk_flag\":\"privilege_escalation\",\"parent_span_id\":\"$ASH_LAST_COMMAND_SPAN_ID\"}"
         fi
         emit_event "privilege_escalation" "$priv_extra"
     fi
+
+    # Do not let this trace leak into the next unrelated event (session end,
+    # audit or container events). Prompt-time file events re-select it from
+    # ASH_LAST_COMMAND_TRACE_ID before emitting.
+    ASH_CURRENT_TRACE_ID=""
 }
 
 # ─── PROMPT_COMMAND Integration ──────────────────────────────────────────────
@@ -810,16 +895,32 @@ ash_prompt_command() {
     # Check for file changes from last command
     check_pending_file_changes "${BASH_COMMAND:-unknown}"
 
-    # Emit command_end for last command if exit code is non-zero
+    # Emit command_end for last command if exit code is non-zero. Reuse the
+    # last command's trace and parent the event to its command_start span.
     if [[ $last_exit -ne 0 ]]; then
+        if [[ -n "$ASH_LAST_COMMAND_TRACE_ID" ]]; then
+            ASH_CURRENT_TRACE_ID="$ASH_LAST_COMMAND_TRACE_ID"
+        fi
         local extra
         if command -v jq >/dev/null 2>&1; then
-            extra=$(jq -n -c --argjson ec "$last_exit" '{exit_code: $ec, status: "failed"}')
+            extra=$(jq -n -c \
+                --argjson ec "$last_exit" \
+                --arg pspid "$ASH_LAST_COMMAND_SPAN_ID" \
+                '{exit_code: $ec, status: "failed"} +
+                 (if $pspid == "" then {} else {parent_span_id: $pspid} end)')
         else
-            extra="{\"exit_code\":$last_exit,\"status\":\"failed\"}"
+            extra="{\"exit_code\":$last_exit,\"status\":\"failed\""
+            if [[ -n "$ASH_LAST_COMMAND_SPAN_ID" ]]; then
+                extra+=",\"parent_span_id\":\"$ASH_LAST_COMMAND_SPAN_ID\""
+            fi
+            extra+="}"
         fi
         emit_event "command_end" "$extra"
     fi
+
+    # The command trace ends here; a session end or another root event must
+    # start a new trace instead of attaching to the last command.
+    ASH_CURRENT_TRACE_ID=""
 }
 
 # ─── inotify Background Watcher ─────────────────────────────────────────────

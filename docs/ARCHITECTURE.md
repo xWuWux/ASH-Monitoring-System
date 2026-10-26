@@ -100,7 +100,16 @@
 The consumer and API emit one JSON object per application log record to
 stdout; the consumer also writes a bounded rotating file. Event-related
 consumer lines carry `event_id`/`session_id`, and API responses carry
-`X-Request-ID`.
+`X-Request-ID`. Log records gain `trace_id`/`span_id` automatically while a
+span is current.
+
+The agent emits W3C `trace_id`/`span_id`/`parent_span_id` with its events
+instead of running an OpenTelemetry SDK. The consumer reconstructs the exact
+agent span, parents its own processing span to it, and links batched events
+from a batch-root span. The API continues an inbound `traceparent` as a
+server span. Tracing is opt-in (`ASH_TRACING_ENABLED`), exports OTLP/HTTP to
+`ASH_OTLP_ENDPOINT`, and is best-effort: a tracing failure never drops or
+duplicates an event.
 
 Health is split into liveness and readiness. Consumer readiness requires a
 successful storage path (PostgreSQL when enabled, local JSONL always) and no
@@ -112,8 +121,8 @@ timestamp.
 
 Agent logs stay local and append-only; agent events reach the central server
 through Kafka. See `docs/OBSERVABILITY.md` for the schema, metrics,
-environment-variable domains, and security rules. Distributed tracing and the
-monitoring stack are later PRs.
+environment-variable domains, trace model, and security rules. The
+Grafana/Tempo/Loki/Prometheus stack is delivered in PR 3.
 
 ## Event Schema (v1.0)
 
@@ -126,6 +135,8 @@ Every event conforms to `src/common/schema/event-v1.json`. Key fields:
 - `source` — Which layer generated it (bash-debug, auditd, inotify, etc.)
 - `event_type` — What happened (command_start, file_modify, session_end, etc.)
 - `session_id` — Correlates all events within one login session
+- `trace_id` / `span_id` — W3C IDs for the agent span (optional)
+- `parent_span_id` — optional parent span for command-related events
 - `prev_hash` / `event_hash` — Tamper-evident chain
 
 ## Security Model

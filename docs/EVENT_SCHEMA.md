@@ -102,10 +102,26 @@ All ASH events are JSON objects written as newline-delimited JSON (JSONL). Every
     "risk_score": 3,
     "risk_flags": ["service_restart"],
 
+    "trace_id": "0123456789abcdef0123456789abcdef",
+    "span_id": "0011223344556677",
+    "parent_span_id": null,
+
     "prev_hash": "a1b2c3d4e5f6...",
     "event_hash": "f6e5d4c3b2a1..."
 }
 ```
+
+## Trace Context Fields
+
+| Field | Domain | Description |
+|-------|--------|-------------|
+| `trace_id` | 32 lowercase hex chars, not all zero | W3C trace ID. The agent starts one trace per command. Optional for older agents and non-shell sources. |
+| `span_id` | 16 lowercase hex chars, not all zero | W3C span ID for this event. The consumer reconstructs the agent span with exactly this ID. |
+| `parent_span_id` | 16 lowercase hex chars, not all zero, or omitted | Parent span. `command_end`, `privilege_escalation`, and file events point at their `command_start` span. Omitted for roots. |
+
+Invalid or missing trace context is not an event-validation failure: the
+consumer stores `NULL` and starts a new trace. The fields are part of the
+signed event body, so they are covered by `event_hash`.
 
 ## Integrity Fields
 

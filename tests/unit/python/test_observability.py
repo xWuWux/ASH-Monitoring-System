@@ -196,6 +196,39 @@ def test_log_extra_drops_unknown_and_reserved_keys():
     }
 
 
+def test_json_formatter_adds_the_active_trace_fields(monkeypatch):
+    monkeypatch.setattr(
+        "ash_tracing.current_trace_fields",
+        lambda: {"trace_id": "a" * 32, "span_id": "b" * 16},
+    )
+    record = logging.LogRecord(
+        "ash-consumer", logging.INFO, __file__, 1, "processing", (), None
+    )
+
+    payload = json.loads(JsonFormatter("ash-consumer").format(record))
+
+    assert payload["trace_id"] == "a" * 32
+    assert payload["span_id"] == "b" * 16
+
+
+def test_json_formatter_preserves_explicit_trace_fields(monkeypatch):
+    """A record can log the agent's span while the consumer span is active."""
+    monkeypatch.setattr(
+        "ash_tracing.current_trace_fields",
+        lambda: {"trace_id": "a" * 32, "span_id": "b" * 16},
+    )
+    record = logging.LogRecord(
+        "ash-consumer", logging.INFO, __file__, 1, "processing", (), None
+    )
+    record.trace_id = "c" * 32
+    record.span_id = "d" * 16
+
+    payload = json.loads(JsonFormatter("ash-consumer").format(record))
+
+    assert payload["trace_id"] == "c" * 32
+    assert payload["span_id"] == "d" * 16
+
+
 def test_sd_notify_sends_a_datagram_when_notify_socket_is_set(tmp_path, monkeypatch):
     socket_path = tmp_path / "notify.sock"
     receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)

@@ -144,10 +144,11 @@ install_consumer() {
         install -m 755 src/consumer/api_server.py "$INSTALL_DIR/lib/ash/"
     }
     install -m 644 src/consumer/ash_alerting.py "$INSTALL_DIR/lib/ash/"
-    # Shared by the consumer and API: JSON logging/correlation helpers and
-    # the gunicorn multiprocess-metrics lifecycle hooks. Both are imported
-    # from /usr/local/lib/ash by the installed units.
+    # Shared by the consumer and API: JSON logging/correlation helpers,
+    # W3C tracing, and the gunicorn multiprocess-metrics lifecycle hooks.
+    # All are imported from /usr/local/lib/ash by the installed units.
     install -m 644 src/consumer/ash_observability.py "$INSTALL_DIR/lib/ash/"
+    install -m 644 src/consumer/ash_tracing.py "$INSTALL_DIR/lib/ash/"
     install -m 644 src/consumer/gunicorn.conf.py "$INSTALL_DIR/lib/ash/"
 
     # Python dependencies

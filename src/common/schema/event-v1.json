@@ -81,6 +81,21 @@
         "audit_key": { "type": ["string", "null"] },
         "risk_score": { "type": "integer", "minimum": 0, "maximum": 10 },
         "risk_flags": { "type": "array", "items": { "type": "string" } },
+        "trace_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$",
+            "description": "W3C trace-id, lowercase hex; the agent generates one trace per command"
+        },
+        "span_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{16}$",
+            "description": "W3C span-id for this event, lowercase hex"
+        },
+        "parent_span_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{16}$",
+            "description": "Parent span-id when this event belongs to a command_start or file-change span; omitted for roots"
+        },
         "prev_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "event_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
     }

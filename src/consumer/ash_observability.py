@@ -145,6 +145,24 @@ class _ComponentFilter(logging.Filter):
         return True
 
 
+def _active_trace_fields() -> Mapping[str, str]:
+    """Return the current span's trace_id/span_id, if tracing is active.
+
+    Domain: no input; returns an empty mapping when ``ash_tracing`` is not
+    installed, tracing is disabled, or no span is current.  Kept lazy so the
+    logging module does not import the OpenTelemetry SDK and does not form an
+    import cycle with ``ash_tracing`` (which imports this module).
+    """
+    try:
+        from ash_tracing import current_trace_fields
+    except ImportError:
+        return {}
+    try:
+        return current_trace_fields()
+    except Exception:  # noqa: BLE001 - logging must never break on tracing
+        return {}
+
+
 class JsonFormatter(logging.Formatter):
     """Format a log record as one JSON object.
 
@@ -152,6 +170,10 @@ class JsonFormatter(logging.Formatter):
     ``timestamp``, ``severity``, ``component``, ``logger``, ``message``, and
     ``pid`` plus allow-listed correlation fields.  Values in the allow-list
     are omitted when they are ``None``.
+
+    When a trace span is current, ``trace_id`` and ``span_id`` are added
+    automatically.  An explicit value already set on the record wins, so a
+    caller can log the event's agent span while another span is active.
     """
 
     def __init__(self, component: str):
@@ -175,6 +197,9 @@ class JsonFormatter(logging.Formatter):
             value = getattr(record, field, None)
             if value is not None:
                 payload[field] = value
+
+        for field, value in _active_trace_fields().items():
+            payload.setdefault(field, value)
 
         if record.exc_info:
             payload["exception"] = redact_text(self.formatException(record.exc_info))
