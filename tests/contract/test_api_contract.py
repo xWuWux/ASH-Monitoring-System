@@ -26,6 +26,9 @@ EVENT_SEARCH_KEYS = {
     "log_timestamp",
     "session_id",
     "risk_score",
+    "trace_id",
+    "span_id",
+    "parent_span_id",
 }
 
 SESSION_KEYS = {
@@ -188,6 +191,12 @@ def test_event_search_contract(api_client, admin_headers, contract_data):
     # Ordered newest first.
     assert data["events"][0]["event_id"] == contract_data["second_event"]
     assert data["events"][1]["event_id"] == contract_data["first_event"]
+    assert data["events"][0]["trace_id"] == contract_data["trace_id"]
+    assert data["events"][0]["span_id"] == contract_data["second_span"]
+    assert data["events"][0]["parent_span_id"] == contract_data["first_span"]
+    assert data["events"][1]["trace_id"] == contract_data["trace_id"]
+    assert data["events"][1]["span_id"] == contract_data["first_span"]
+    assert data["events"][1]["parent_span_id"] is None
 
 
 def test_event_search_filters_contract(api_client, admin_headers, contract_data):

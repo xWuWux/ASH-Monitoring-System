@@ -1,9 +1,10 @@
 # ASH Observability
 
-This document covers the observability foundation delivered in PR 1:
-structured logs, request/event correlation, health signals, and Prometheus
-metrics. Distributed tracing and the Grafana/Tempo/Loki/Prometheus stack are
-delivered in later PRs and are not required for the behavior below.
+This document covers the observability foundation delivered in PR 1
+(structured logs, request/event correlation, health signals, and Prometheus
+metrics) and distributed tracing delivered in PR 2. The Grafana/Tempo/Loki
+monitoring stack is delivered in PR 3 and is not required for the behavior
+below.
 
 ## Design rules
 
@@ -25,6 +26,12 @@ delivered in later PRs and are not required for the behavior below.
 5. **Metrics may be imperfect, but they must say so.** The Kafka lag gauge is
    position-based, not committed-offset lag; its help text and this document
    say that explicitly.
+6. **Tracing never changes the data path.** Span creation, attachment, export,
+   and shutdown are best-effort. A tracing failure is logged and swallowed;
+   it can never drop, duplicate, or delay an event or an HTTP response.
+7. **No per-host OpenTelemetry runtime.** The agent emits portable W3C IDs and
+   the consumer reconstructs the agent span. Only the consumer and API run an
+   OTel SDK, and only when tracing is explicitly enabled.
 
 ## Log schema
 
@@ -57,9 +64,13 @@ Every consumer/API application log record is one JSON object:
 | `message` / `exception` | string | Redacted centrally: URL userinfo and `password=`/`token:` assignments become `[redacted]` |
 | `error_type` | exception class or reason code | Safe replacement for exception text |
 | `exception` | stack trace string | Only where the exception text is safe to retain (consumer flush/handler errors) |
+| `trace_id` | 32 lowercase hex chars, not all zero | Active span's trace ID, or the explicitly logged event trace ID |
+| `span_id` | 16 lowercase hex chars, not all zero | Active span's ID, or the explicitly logged event span ID |
 
-`trace_id`, `span_id`, and `hostname` are already accepted by the schema so
-PR 2 can add tracing without changing the log contract.
+`trace_id`/`span_id` appear automatically while a span is current. When a
+record explicitly sets them (for example an agent event log line), the
+explicit values win, so the log can identify the agent span even while the
+consumer's processing span is active.
 
 ### Correlation
 
@@ -67,9 +78,10 @@ PR 2 can add tracing without changing the log contract.
   access log. Unsafe or oversized inbound values are replaced with a UUID.
 * **Consumer:** every event-related log line carries `event_id` and, when
   present, `session_id`. The Kafka payload's `event_id` is the stable join key
-  to the database, JSONL files, DLQ, and (in PR 2) the synthetic agent span.
+  to the database, JSONL files, DLQ, and the synthetic agent span.
 * **Agent → consumer:** the agent's `events.jsonl` line contains `event_id`;
-  the consumer logs that ID when an event is rejected or duplicated.
+  the consumer logs that ID when an event is rejected or duplicated. It also
+  contains the W3C trace context used to reconstruct the trace (below).
 
 ## Log destinations and rotation
 
@@ -117,6 +129,62 @@ uses `Type=notify` plus `WatchdogSec=60`, with a heartbeat every 10 seconds.
 Docker uses readiness for container health. The consumer systemd unit uses
 `Type=notify` plus a watchdog; the API unit exposes the same endpoints for an
 external checker or load balancer. Liveness is for restart decisions only.
+
+## Distributed tracing
+
+Tracing is **disabled by default**. When enabled, the consumer and API export
+OTLP/HTTP spans to `ASH_OTLP_ENDPOINT`; the agent never runs an OTel SDK.
+
+### Trace model
+
+| Producer | Span | Parent | Notes |
+|----------|------|--------|-------|
+| Agent | `ash.agent.<event_type>` | `parent_span_id` when present | The consumer creates this span with the agent's **exact** `trace_id`/`span_id`; it is not a new span with a copied attribute |
+| Consumer | `ash.consumer.process_event` | Reconstructed agent span | One per Kafka event |
+| Consumer | `ash.consumer.flush_batch` | none (root) | A batch can contain many traces, so it links to each event span instead of inventing a parent |
+| Consumer | `ash.db.insert_events` | `ash.consumer.flush_batch` | Child of the batch root; only when PostgreSQL is enabled |
+| API | `ash.api.request` | Inbound W3C `traceparent` when valid | Server span; no outbound HTTP calls are traced yet |
+
+The agent generates one trace per command. `command_start` is the root; the
+matching `command_end`, `privilege_escalation`, and file-change events reuse
+that trace and are parented to the command span. Session and non-bash events
+are separate roots. The IDs are optional in the event schema: a malformed or
+missing context starts a new consumer-side trace rather than dead-lettering
+the event.
+
+Sampling is deterministic per trace ID (`ASH_TRACING_SAMPLE_RATIO`). This is
+why a `command_end` child is never exported when its `command_start` root was
+dropped at a partial ratio. An inbound API `traceparent` marked sampled still
+wins over a local ratio of `0`, so an upstream trace is not silently severed.
+Batch-root links report the same ratio-derived decision as the reconstructed
+agent span, so a tail sampler or span-metrics connector is never told that a
+dropped trace was sampled.
+
+### Storage and retrieval
+
+`command_logs` stores the validated `trace_id`, `span_id`, and
+`parent_span_id` (all nullable, with `idx_cmd_logs_trace`). Invalid values are
+stored as `NULL`; event processing still succeeds. `GET /api/v1/events`
+returns those columns, and `GET /api/v1/events/<event_id>` returns them as
+part of the full row.
+
+### Safety boundaries
+
+* Attributes contain event metadata only (`event_id`, `event_type`, `source`,
+  `hostname`, `session_id`, user, exit code, risk score, HTTP method/route),
+  never command text, output, headers, query strings, JWTs, or database URLs.
+* Exception recording stores only `exception.type` and an ERROR status, never
+  `str(error)` or traceback text.
+* `ASH_OTLP_ENDPOINT` rejects userinfo so a credential cannot be placed in
+  configuration or logs. Use HTTPS for a collector on another host; plain
+  HTTP is intended for a loopback/sidecar collector.
+* Enabling tracing without an endpoint, or with an invalid ratio/URL, fails
+  startup instead of silently dropping spans.
+* SDK creation, span attachment, export, and shutdown failures are logged by
+  type and swallowed. A broken exporter cannot fail a flush or an API request.
+* The API flushes queued spans from an `atexit` handler on normal gunicorn
+  worker exit. `SIGKILL`/worker timeouts lose queued spans; that is accepted
+  best-effort behavior, not a data-loss path for events.
 
 ## Metrics
 
@@ -170,12 +238,12 @@ and calls `mark_process_dead()` when a worker exits.
 ### Installed layout
 
 `scripts/install.sh` places the executable at `/usr/local/bin/ash-consumer`
-and the shared modules (`ash_observability.py`, `ash_alerting.py`,
-`api_server.py`, `gunicorn.conf.py`) in `/usr/local/lib/ash`. The consumer
-adds that directory to `sys.path` before importing its siblings, and the
-systemd unit also sets `PYTHONPATH=/usr/local/lib/ash:...`; running from a
-source checkout or the container, where the files are siblings, needs
-neither.
+and the shared modules (`ash_observability.py`, `ash_tracing.py`,
+`ash_alerting.py`, `api_server.py`, `gunicorn.conf.py`) in
+`/usr/local/lib/ash`. The consumer adds that directory to `sys.path` before
+importing its siblings, and the systemd unit also sets
+`PYTHONPATH=/usr/local/lib/ash:...`; running from a source checkout or the
+container, where the files are siblings, needs neither.
 
 ## Environment variables
 
@@ -203,6 +271,9 @@ would silently point at the wrong broker, URL, or directory.
 | `ASH_BATCH_SIZE` | Integer ≥ 1 | `100` | Events per flush |
 | `ASH_BATCH_TIMEOUT` | Finite number ≥ 0.001 | `5.0` | Seconds before a partial batch flushes |
 | `ASH_ALERT_LOG` | Writable file path; unset or empty uses the default | `/var/log/ash/alerts.jsonl` | Alert JSONL destination when the consumer does not pass an explicit path |
+| `ASH_TRACING_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = disabled | `false` | Enables OTLP span export; any other value fails startup |
+| `ASH_OTLP_ENDPOINT` | Absolute `http`/`https` URL with a host, no userinfo | empty | OTLP/HTTP traces URL; required when tracing is enabled |
+| `ASH_TRACING_SAMPLE_RATIO` | Finite number in `[0.0, 1.0]` | `1.0` | Trace-ID-ratio sampling; a sampled API parent still wins |
 
 The JSON config keys `log_name`, `log_max_bytes`, `log_backup_count`,
 `metrics_host`, and `metrics_port` mirror these settings; see
@@ -216,6 +287,9 @@ The JSON config keys `log_name`, `log_max_bytes`, `log_backup_count`,
 | `ASH_LOG_DIR` | Non-empty writable directory path or unset | unset | Enables per-worker `api-<pid>.log`; stdout is always JSON |
 | `ASH_METRICS_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = false | `false` | Serves `/metrics` instead of 404; any other value fails startup |
 | `ASH_METRICS_TOKEN` | Non-empty secret or empty | empty | Bearer token required by `/metrics`; empty fails closed |
+| `ASH_TRACING_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = disabled | `false` | Enables OTLP span export; any other value fails startup |
+| `ASH_OTLP_ENDPOINT` | Absolute `http`/`https` URL with a host, no userinfo | empty | OTLP/HTTP traces URL; required when tracing is enabled |
+| `ASH_TRACING_SAMPLE_RATIO` | Finite number in `[0.0, 1.0]` | `1.0` | Trace-ID-ratio sampling for new traces; a sampled inbound `traceparent` wins |
 | `PROMETHEUS_MULTIPROC_DIR` | Writable directory path | unset in single-process mode; `/tmp/ash-prometheus` in the image | Aggregates metrics across gunicorn workers |
 
 ### Agent and deployment
@@ -228,6 +302,11 @@ The JSON config keys `log_name`, `log_max_bytes`, `log_backup_count`,
 
 * Webhook URLs are logged as `scheme://host[:port]` only. Delivery failures
   log the exception class, not `str(exception)` (which embeds the URL).
+* Trace attributes never include command text, output, headers, query strings,
+  or credentials. Exception events carry only the exception type. The OTLP
+  endpoint is validated and cannot contain URL userinfo.
+* The agent emits trace IDs but does not send telemetry directly; only the
+  consumer/API export spans, and only when tracing is enabled.
 * API access logs include the path but never the query string, headers, or
   body. Search terms and JWTs therefore do not reach central logs.
 * API `/metrics` is disabled by default and fails closed when enabled without
@@ -258,7 +337,16 @@ curl -fsS -H "Authorization: Bearer $ASH_METRICS_TOKEN" \
 
 # Structured logs (one JSON object per line)
 tail -n 1 /var/log/ash/consumer.log | jq .
+
+# Trace the exact agent span for an event (PostgreSQL)
+psql "$ASH_DATABASE_URL" -c \
+  "SELECT event_id, trace_id, span_id, parent_span_id
+     FROM command_logs ORDER BY log_timestamp DESC LIMIT 5;"
 ```
+
+With tracing enabled, search the collector/Tempo for the returned
+`trace_id`; the span with `span_id` equal to the row's `span_id` is the
+reconstructed agent span, and `ash.consumer.process_event` is its child.
 
 The blocking `kafka-e2e` CI job waits for `/health/ready`, checks the
 consumer metrics, and parses every consumer log line as JSON.

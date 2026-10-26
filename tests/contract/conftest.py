@@ -73,6 +73,9 @@ def contract_data(database_url, contract_schema):
     first_time = _naive_utc_now() - timedelta(hours=2)
     second_time = first_time + timedelta(minutes=5)
     command = f"contract-command-{tag}"
+    trace_id = "1" * 32
+    first_span = "1" * 16
+    second_span = "2" * 16
 
     data = {
         "tag": tag,
@@ -85,6 +88,9 @@ def contract_data(database_url, contract_schema):
         "rule_name": f"contract-rule-{tag}",
         "first_time": first_time,
         "second_time": second_time,
+        "trace_id": trace_id,
+        "first_span": first_span,
+        "second_span": second_span,
     }
 
     conn = psycopg2.connect(database_url)
@@ -114,9 +120,10 @@ def contract_data(database_url, contract_schema):
                 INSERT INTO command_logs
                     (event_id, schema_version, hostname, source, event_type,
                      username, session_id, command, cwd, exit_code,
-                     log_timestamp, risk_score, prev_hash, event_hash)
+                     log_timestamp, risk_score, prev_hash, event_hash,
+                     trace_id, span_id)
                 VALUES (%s, '1.0', %s, 'bash-debug', 'command_start', %s, %s,
-                        %s, '/srv/app', 0, %s, 95, %s, %s)
+                        %s, '/srv/app', 0, %s, 95, %s, %s, %s, %s)
                 """,
                 (
                     str(first_event),
@@ -127,6 +134,8 @@ def contract_data(database_url, contract_schema):
                     first_time,
                     GENESIS_HASH,
                     FIRST_HASH,
+                    trace_id,
+                    first_span,
                 ),
             )
             cursor.execute(
@@ -134,9 +143,10 @@ def contract_data(database_url, contract_schema):
                 INSERT INTO command_logs
                     (event_id, schema_version, hostname, source, event_type,
                      username, session_id, command, cwd, exit_code,
-                     log_timestamp, risk_score, prev_hash, event_hash)
+                     log_timestamp, risk_score, prev_hash, event_hash,
+                     trace_id, span_id, parent_span_id)
                 VALUES (%s, '1.0', %s, 'bash-debug', 'command_end', %s, %s,
-                        %s, '/srv/app', 0, %s, 0, %s, %s)
+                        %s, '/srv/app', 0, %s, 0, %s, %s, %s, %s, %s)
                 """,
                 (
                     str(second_event),
@@ -147,6 +157,9 @@ def contract_data(database_url, contract_schema):
                     second_time,
                     FIRST_HASH,
                     SECOND_HASH,
+                    trace_id,
+                    second_span,
+                    first_span,
                 ),
             )
             cursor.execute(

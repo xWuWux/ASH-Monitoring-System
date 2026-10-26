@@ -89,7 +89,9 @@ sent_count() {
         .event_type == "command_start" and
         .hostname != "" and
         .session_id != "" and
-        (.event_id | test("^[0-9a-f-]{36}$"))
+        (.event_id | test("^[0-9a-f-]{36}$")) and
+        (.trace_id | test("^[a-f0-9]{32}$")) and
+        (.span_id | test("^[a-f0-9]{16}$"))
     ' "$ASH_EVENTS_FILE"
     [[ $status -eq 0 ]]
 }

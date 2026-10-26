@@ -268,3 +268,40 @@ def test_event_search_count_query_does_not_keep_order_by(
     assert len(count_queries) == 1
     assert "ORDER BY" not in count_queries[0]
     assert "LIMIT" not in count_queries[0]
+
+
+def test_event_search_returns_trace_context_columns(
+    api_client, api_module, monkeypatch
+):
+    queries = []
+    monkeypatch.setattr(api_module, "get_db", lambda: _SearchConnection(queries))
+    token = jwt.encode(
+        {"sub": "test-admin", "role": "admin"},
+        "test-only-jwt-secret-not-for-production",
+        algorithm="HS256",
+    )
+
+    response = api_client.get(
+        "/api/v1/events?hostname=host-a",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    select_query = next(
+        query for query, _params in queries if "FROM command_logs" in query
+    )
+    for column in ("trace_id", "span_id", "parent_span_id"):
+        assert column in select_query
+    # The count query must remain a valid aggregate: it replaces the whole
+    # select list instead of appending columns to COUNT(*).
+    count_query = next(query for query, _params in queries if "COUNT(*)" in query)
+    assert "trace_id" not in count_query
+
+
+def test_api_registers_a_tracing_flush_on_normal_exit(api_module, monkeypatch):
+    registered = []
+    monkeypatch.setattr(api_module.atexit, "register", registered.append)
+
+    api_module._register_tracing_shutdown()
+
+    assert registered == [api_module.shutdown_tracing]

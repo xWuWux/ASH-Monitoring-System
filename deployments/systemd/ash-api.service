@@ -31,6 +31,11 @@ Environment=ASH_LOG_LEVEL=INFO
 # Metrics stay off until the monitoring stack is configured and
 # ASH_METRICS_TOKEN is added to /etc/ash/api.env.
 Environment=ASH_METRICS_ENABLED=false
+# Tracing is opt-in. Add ASH_TRACING_ENABLED=true and a full OTLP/HTTP URL
+# in ASH_OTLP_ENDPOINT to /etc/ash/api.env; enabling it without an endpoint
+# is a deliberate startup failure.
+Environment=ASH_TRACING_ENABLED=false
+Environment=ASH_TRACING_SAMPLE_RATIO=1.0
 
 # Placeholder default; override by adding ASH_DATABASE_URL to
 # /etc/ash/api.env once Postgres is provisioned (install.sh cannot

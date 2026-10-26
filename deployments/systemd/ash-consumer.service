@@ -31,6 +31,12 @@ Environment=PYTHONPATH=/usr/local/lib/ash:/usr/local/lib/python3/dist-packages
 Environment=ASH_LOG_LEVEL=INFO
 # Loopback-only by default; Prometheus on the same host can scrape it.
 Environment=ASH_METRICS_HOST=127.0.0.1
+# Tracing is opt-in. To enable it, add a drop-in with
+# ASH_TRACING_ENABLED=true and a full OTLP/HTTP URL in ASH_OTLP_ENDPOINT,
+# for example http://127.0.0.1:4318/v1/traces. Enabling tracing without an
+# endpoint is a deliberate startup failure.
+Environment=ASH_TRACING_ENABLED=false
+Environment=ASH_TRACING_SAMPLE_RATIO=1.0
 
 # Security hardening
 ProtectSystem=strict

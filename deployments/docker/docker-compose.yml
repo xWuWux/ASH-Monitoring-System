@@ -78,6 +78,11 @@ services:
       # network; port 9090 is not published to the host.
       ASH_METRICS_HOST: "0.0.0.0"
       ASH_LOG_LEVEL: ${ASH_LOG_LEVEL:-INFO}
+      # Tracing is opt-in. Enabling it without ASH_OTLP_ENDPOINT fails
+      # startup; the collector itself is added in PR 3.
+      ASH_TRACING_ENABLED: ${ASH_TRACING_ENABLED:-false}
+      ASH_OTLP_ENDPOINT: ${ASH_OTLP_ENDPOINT:-}
+      ASH_TRACING_SAMPLE_RATIO: ${ASH_TRACING_SAMPLE_RATIO:-1.0}
     volumes:
       - ash_logs:/var/log/ash
       - ash_archive:/var/archive/ash
@@ -121,6 +126,10 @@ services:
       # values. It is fail-closed: enabled without a token returns 401.
       ASH_METRICS_ENABLED: ${ASH_METRICS_ENABLED:-false}
       ASH_METRICS_TOKEN: ${ASH_METRICS_TOKEN:-}
+      # Same opt-in tracing configuration as the consumer.
+      ASH_TRACING_ENABLED: ${ASH_TRACING_ENABLED:-false}
+      ASH_OTLP_ENDPOINT: ${ASH_OTLP_ENDPOINT:-}
+      ASH_TRACING_SAMPLE_RATIO: ${ASH_TRACING_SAMPLE_RATIO:-1.0}
     restart: unless-stopped
     healthcheck:
       # python:3.12-slim does not ship curl; use the interpreter the image

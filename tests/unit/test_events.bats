@@ -94,6 +94,80 @@ pending_count() {
     [[ $status -eq 0 ]]
 }
 
+@test "emit_event emits valid W3C trace and span identifiers" {
+    emit_event "command_start" '{"command":"true"}'
+
+    run jq -r '.trace_id + " " + .span_id' "$ASH_EVENTS_FILE"
+    [[ $status -eq 0 ]]
+    read -r trace_id span_id <<<"$output"
+    [[ "$trace_id" =~ ^[a-f0-9]{32}$ ]]
+    [[ "$span_id" =~ ^[a-f0-9]{16}$ ]]
+    [[ "$trace_id" != "00000000000000000000000000000000" ]]
+    [[ "$span_id" != "0000000000000000" ]]
+}
+
+@test "command_end reuses the command trace and parents to command_start" {
+    BASH_COMMAND="false"
+    log_command
+    false
+    ash_prompt_command
+
+    run jq -s -e '
+        (map(select(.event_type == "command_start")) | last) as $start |
+        (map(select(.event_type == "command_end")) | last) as $end |
+        $start and $end and
+        $start.trace_id == $end.trace_id and
+        $end.parent_span_id == $start.span_id
+    ' "$ASH_EVENTS_FILE"
+    [[ $status -eq 0 ]]
+}
+
+@test "file events reuse the command trace and clear it afterwards" {
+    local target="$BATS_TEST_TMPDIR/watched.txt"
+    local snapshot="$BATS_TEST_TMPDIR/snapshot"
+    printf 'before\n' >"$target"
+    printf 'before\n' >"$snapshot"
+
+    BASH_COMMAND="true"
+    log_command
+    ASH_PENDING_SNAPSHOTS+=("${target}|${snapshot}")
+    printf 'after\n' >"$target"
+
+    check_pending_file_changes "echo after > $target"
+
+    # The trace must not leak into a session/container event emitted later.
+    [[ -z "$ASH_CURRENT_TRACE_ID" ]]
+    run jq -s -e '
+        (map(select(.event_type == "command_start")) | last) as $start |
+        (map(select(.event_type == "file_modify")) | last) as $file |
+        $start and $file and
+        $file.trace_id == $start.trace_id and
+        $file.parent_span_id == $start.span_id
+    ' "$ASH_EVENTS_FILE"
+    [[ $status -eq 0 ]]
+}
+
+@test "session_end starts a separate root trace after a command" {
+    export ASH_START_TIME="$(date +%s)"
+    export ASH_SESSION_START="2026-01-01T00:00:00Z"
+    export EVENTS_LOGGED=0
+
+    BASH_COMMAND="false"
+    log_command
+    false
+    ash_prompt_command
+    emit_session_end
+
+    run jq -s -e '
+        (map(select(.event_type == "command_start")) | last) as $start |
+        (map(select(.event_type == "session_end")) | last) as $end |
+        $start and $end and
+        $start.trace_id != $end.trace_id and
+        ($end.parent_span_id == null)
+    ' "$ASH_EVENTS_FILE"
+    [[ $status -eq 0 ]]
+}
+
 @test "emit_event does not spool when Kafka is disabled" {
     export KAFKA_ENABLED=false
     emit_event "command_start" '{"command":"true"}'

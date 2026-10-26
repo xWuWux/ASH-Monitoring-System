@@ -4,6 +4,7 @@ ASH REST API Server — Search, analytics, and real-time streaming.
 Provides JWT-based authentication and RBAC.
 """
 
+import atexit
 import hmac
 import logging
 import os
@@ -39,6 +40,7 @@ from ash_observability import (
     new_request_id,
     sanitize_request_id,
 )
+from ash_tracing import configure_tracing, shutdown_tracing
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -77,6 +79,27 @@ logger = configure_logging(
     log_dir=_ash_log_dir,
     log_name=f"api-{os.getpid()}.log",
 )
+
+# Validate tracing configuration at import time: enabling it without an
+# endpoint is a startup error, not a silent drop of every span.  Disabled
+# tracing is a no-op and does not require the OpenTelemetry SDK to be
+# installed (the shared module imports it lazily).
+_TRACING = configure_tracing("ash-api")
+
+
+def _register_tracing_shutdown() -> None:
+    """Flush this worker's queued spans when it exits normally.
+
+    Domain: no input; registers a process ``atexit`` handler.  Gunicorn
+    workers exit through normal interpreter shutdown on SIGTERM/SIGQUIT, so
+    this is where a BatchSpanProcessor's queue is flushed.  SIGKILL and
+    worker timeouts cannot be handled; losing those spans is an accepted
+    best-effort failure, never a reason to fail the request.
+    """
+    atexit.register(shutdown_tracing)
+
+
+_register_tracing_shutdown()
 
 # Validate the metrics flag at import so a typo prevents startup instead of
 # silently leaving the endpoint disabled.
@@ -231,13 +254,40 @@ def _start_request_observation():
     g.inflight_counted = True
     API_INFLIGHT.inc()
 
+    # Continue an inbound W3C trace, or start a new one.  Only the method,
+    # matched route, and request ID are recorded: the raw path, query string,
+    # headers, and body can contain credentials or monitored command text.
+    route = request.url_rule.rule if request.url_rule is not None else "unmatched"
+    g.trace_span = _TRACING.start_server_span(
+        "ash.api.request",
+        request.headers,
+        attributes={
+            "http.request.method": request.method,
+            "http.route": route,
+            "ash.request_id": g.request_id,
+        },
+    )
+    g.trace_span.attach()
+
 
 @app.teardown_request
-def _finish_request_observation(_error):
-    """Release the in-flight gauge exactly once per request."""
+def _finish_request_observation(error):
+    """Release the in-flight gauge and end the request span exactly once."""
     if getattr(g, "inflight_counted", False):
         API_INFLIGHT.dec()
         g.inflight_counted = False
+
+    span = getattr(g, "trace_span", None)
+    if span is not None:
+        status = getattr(g, "response_status", None)
+        if status is not None:
+            span.set_attribute("http.response.status_code", status)
+        if error is not None:
+            span.record_exception(error)
+        elif status is not None and status >= 500:
+            span.mark_error()
+        span.finish()
+        g.trace_span = None
 
 
 @app.after_request
@@ -251,6 +301,9 @@ def _log_request(response):
     """
     request_id = getattr(g, "request_id", None) or new_request_id()
     response.headers["X-Request-ID"] = request_id
+    # The teardown handler runs after this one and needs the status code to
+    # finish the server span.
+    g.response_status = response.status_code
 
     started = getattr(g, "request_started", None)
     duration = max(0.0, time.monotonic() - started) if started else 0.0
@@ -469,7 +522,7 @@ def search_events():
     limit = _int_arg("limit", 100, maximum=1000)
     offset = _int_arg("offset", 0)
 
-    query = "SELECT event_id, hostname, source, event_type, username, command, cwd, exit_code, log_timestamp, session_id, risk_score FROM command_logs WHERE 1=1"
+    query = "SELECT event_id, hostname, source, event_type, username, command, cwd, exit_code, log_timestamp, session_id, risk_score, trace_id, span_id, parent_span_id FROM command_logs WHERE 1=1"
     params = []
 
     if hostname:
@@ -510,7 +563,7 @@ def search_events():
             # (column must appear in GROUP BY), and LIMIT/OFFSET do not
             # belong in a total. params[:-2] already drops limit/offset.
             count_query = query.replace(
-                "SELECT event_id, hostname, source, event_type, username, command, cwd, exit_code, log_timestamp, session_id, risk_score",
+                "SELECT event_id, hostname, source, event_type, username, command, cwd, exit_code, log_timestamp, session_id, risk_score, trace_id, span_id, parent_span_id",
                 "SELECT COUNT(*)",
             ).split(" ORDER BY ", 1)[0]
             cursor.execute(count_query, params[:-2])

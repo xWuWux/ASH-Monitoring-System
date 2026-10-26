@@ -406,7 +406,11 @@ def test_database_batch_stores_the_exact_raw_text(
     consumer.config["database_enabled"] = True
     connection = _RecordingConnection()
     consumer.db_conn = connection
-    event = event_factory()
+    event = event_factory(
+        trace_id="a" * 32,
+        span_id="b" * 16,
+        parent_span_id="c" * 16,
+    )
     raw_text = json.dumps(event, separators=(",", ":"))
 
     def record_command_rows(cursor, sql, values, template=None):
@@ -417,10 +421,35 @@ def test_database_batch_stores_the_exact_raw_text(
 
     consumer._write_database_batch([event], [raw_text])
 
-    assert connection.executed[0][25] == raw_text
-    assert connection.executed[0][24] == json.dumps(event, default=str)
+    assert connection.executed[0][22:25] == ("a" * 32, "b" * 16, "c" * 16)
+    assert connection.executed[0][28] == raw_text
+    assert connection.executed[0][27] == json.dumps(event, default=str)
     assert connection.commits == 1
     assert consumer_module.DB_AVAILABLE._value.get() == 1
+
+
+def test_database_batch_stores_null_for_invalid_trace_context(
+    consumer_factory, event_factory, consumer_module, monkeypatch
+):
+    """A malformed trace context must not reject the event or store garbage."""
+    consumer = consumer_factory()
+    consumer.config["database_enabled"] = True
+    connection = _RecordingConnection()
+    consumer.db_conn = connection
+    event = event_factory(
+        trace_id="not-a-trace", span_id="short", parent_span_id="0" * 16
+    )
+
+    def record_command_rows(cursor, sql, values, template=None):
+        if "INSERT INTO command_logs" in sql:
+            cursor.connection.executed.extend(values)
+
+    monkeypatch.setattr(consumer_module, "execute_values", record_command_rows)
+
+    consumer._write_database_batch([event], [None])
+
+    assert connection.executed[0][22:25] == (None, None, None)
+    assert connection.commits == 1
 
 
 def test_failed_batch_retries_rows_and_dlqs_only_the_bad_row(

@@ -219,6 +219,15 @@ definitions, precedence rules, and security notes are in
 | `_metrics_enabled()`, `_metrics_token()`, `_metrics_authorized()` (API) | enabled: `1/true/yes/on` or unset/false; token: non-empty secret; auth: exact `Bearer <token>` | disabled/empty | Fail-closed gate for `/metrics` |
 | `metrics()` (API) | GET; 404 disabled, 401 unauthenticated, 200 with bearer token | — | Opt-in Prometheus endpoint |
 | `on_starting`, `child_exit` (gunicorn) | no-op without `PROMETHEUS_MULTIPROC_DIR` | — | Clear stale mmaps and mark dead workers |
+| `configure_tracing(component)` (tracing) | `ASH_TRACING_ENABLED` boolean; `ASH_OTLP_ENDPOINT` absolute http(s) URL with host and no userinfo; ratio in `[0,1]` | disabled | Opt-in OTLP/HTTP tracing; invalid config fails startup instead of silently dropping spans |
+| `Tracing.start_agent_span(event)` (tracing) | decoded event mapping; optional valid `trace_id`/`span_id`/`parent_span_id` | new trace | Reconstructs the exact agent span; malformed context never rejects the event |
+| `Tracing.start_span`, `start_root_span`, `start_server_span` (tracing) | stable name; optional parent/kind/attributes/links | no-op span | Best-effort span creation; SDK failures are logged by type and swallowed |
+| `Tracing.links_for_events(events)` (tracing) | iterable of event mappings | `[]` | Links a batch-root span to each valid event trace |
+| `trace_context_strings(event)`, `trace_columns(event)` (tracing) | any mapping; W3C IDs validated and normalized | `None` / all-`None` columns | Invalid context is ignored and stored as `NULL` |
+| `SpanHandle.record_exception(error)` (tracing) | any exception | no-op | Records only `exception.type` and ERROR status, never message/traceback |
+| `_ForcedIdGenerator` (tracing) | thread-local 128-bit trace / 64-bit span IDs | random non-zero | Emits the agent's exact IDs once; reports forced IDs as non-random |
+| `shutdown_tracing()`, `Tracing.shutdown()` (tracing) | no input; idempotent | no-op when disabled | Flush queued spans; failures are logged and swallowed |
+| `_register_tracing_shutdown()` (API) | no input; registers `atexit` | — | Flushes queued spans on normal gunicorn worker exit |
 | `watchdog_kick()`, `start_watchdog()` (agent) | no-op without `NOTIFY_SOCKET`; interval ≥ 1s | — | Heartbeat independent of command traffic |
 | `DB_AVAILABLE` (metric) | gauge, `0` or `1` | `1` after a successful write | Consumer database health signal |
 | `API_DATABASE_AVAILABLE` (metric) | gauge, `0` or `1`, `multiprocess_mode=max` | `0` until a readiness check succeeds | API database health signal |

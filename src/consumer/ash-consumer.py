@@ -65,6 +65,7 @@ from ash_observability import (  # noqa: E402
     log_extra,
     sd_notify,
 )
+from ash_tracing import configure_tracing, trace_columns  # noqa: E402
 
 # ─── Prometheus Metrics ──────────────────────────────────────────────────────
 EVENTS_RECEIVED = Counter(
@@ -189,6 +190,9 @@ MAX_FIELD_LENGTHS = {
     "stderr": MAX_TEXT_LENGTH,
     "file_path": MAX_TEXT_LENGTH,
     "diff_content": MAX_TEXT_LENGTH,
+    "trace_id": 32,
+    "span_id": 16,
+    "parent_span_id": 16,
 }
 INTEGER_FIELDS = ("uid", "pid", "ppid", "exit_code")
 
@@ -395,6 +399,10 @@ class ASHConsumer:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self._setup_logging()
+        # Tracing is configured before any data path starts so an invalid
+        # configuration (enabled without an endpoint) fails startup instead
+        # of silently dropping spans later.
+        self.tracing = configure_tracing("ash-consumer")
         self.running = True
         self._stopping = False
         self.started_at: float = time.time()
@@ -717,6 +725,20 @@ class ASHConsumer:
             backup_count=self.config.get("log_backup_count", 5),
         )
 
+    def _get_tracing(self):
+        """Return this process's tracing facade.
+
+        Domain: no input; returns an ``ash_tracing.Tracing`` instance.  Test
+        doubles built with ``object.__new__`` do not run ``__init__``, so the
+        facade is created on first use when the attribute is absent.  A
+        disabled configuration is a cheap no-op object.
+        """
+        tracing = getattr(self, "tracing", None)
+        if tracing is None:
+            tracing = configure_tracing("ash-consumer")
+            self.tracing = tracing
+        return tracing
+
     def _setup_database(self):
         max_retries = 3
         for attempt in range(max_retries):
@@ -779,6 +801,9 @@ class ASHConsumer:
                     raw_event JSONB,
                     raw_event_text TEXT,
                     log_timestamp TIMESTAMP,
+                    trace_id VARCHAR(32),
+                    span_id VARCHAR(16),
+                    parent_span_id VARCHAR(16),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -788,6 +813,15 @@ class ASHConsumer:
                 -- not preserve the bytes that were signed.
                 ALTER TABLE command_logs
                     ADD COLUMN IF NOT EXISTS raw_event_text TEXT;
+
+                -- Tracing is optional; these remain NULL for events emitted
+                -- by an older agent or when tracing is disabled.
+                ALTER TABLE command_logs
+                    ADD COLUMN IF NOT EXISTS trace_id VARCHAR(32);
+                ALTER TABLE command_logs
+                    ADD COLUMN IF NOT EXISTS span_id VARCHAR(16);
+                ALTER TABLE command_logs
+                    ADD COLUMN IF NOT EXISTS parent_span_id VARCHAR(16);
 
                 CREATE INDEX IF NOT EXISTS idx_cmd_logs_hostname_time
                     ON command_logs (hostname, log_timestamp);
@@ -803,6 +837,8 @@ class ASHConsumer:
                     ON command_logs USING gin (to_tsvector('english', coalesce(command, '')));
                 CREATE INDEX IF NOT EXISTS idx_cmd_logs_event_id
                     ON command_logs (event_id);
+                CREATE INDEX IF NOT EXISTS idx_cmd_logs_trace
+                    ON command_logs (trace_id);
 
                 CREATE TABLE IF NOT EXISTS file_changes (
                     id SERIAL PRIMARY KEY,
@@ -1053,7 +1089,40 @@ class ASHConsumer:
     def process_message(
         self, log_data: Dict[str, Any], raw_event_text: Optional[str] = None
     ):
-        """Process a single incoming event with validation and deduplication."""
+        """Process one event inside its reconstructed trace context.
+
+        Domain: ``log_data`` is a decoded event object (normally a dict) and
+        ``raw_event_text`` is the exact consumed payload or ``None``.  The
+        agent span reuses the event's W3C trace_id/span_id when they are
+        valid; a missing or malformed context starts a new trace instead of
+        dead-lettering the event.  The consumer's own processing span is a
+        child of the reconstructed agent span.
+        """
+        tracing = self._get_tracing()
+        event_type = (
+            log_data.get("event_type", "unknown")
+            if isinstance(log_data, dict)
+            else "unknown"
+        )
+        source = (
+            log_data.get("source", "unknown")
+            if isinstance(log_data, dict)
+            else "unknown"
+        )
+        with tracing.start_agent_span(log_data):
+            with tracing.start_span(
+                "ash.consumer.process_event",
+                attributes={
+                    "ash.event_type": str(event_type),
+                    "ash.source": str(source),
+                },
+            ):
+                self._process_message(log_data, raw_event_text)
+
+    def _process_message(
+        self, log_data: Dict[str, Any], raw_event_text: Optional[str] = None
+    ):
+        """Validate, deduplicate, alert on, and buffer one event."""
         try:
             is_valid, reason = self._validate_event(log_data)
             if not is_valid:
@@ -1147,51 +1216,73 @@ class ASHConsumer:
             BATCH_SIZE_GAUGE.set(0)
 
         start_time = time.time()
-        try:
-            # PostgreSQL first. If it is unavailable, the batch stays in
-            # memory and its Kafka offset is not committed; the broker will
-            # replay it after a crash. Writing the local JSONL first would
-            # duplicate lines on every retry while the database is down.
-            if self.config.get("database_enabled", False):
-                self._write_database_batch(batch, raw_texts)
-
-            self._write_file_batch(batch)
-
-            now = time.time()
-            self.last_flush = now
-            self._last_flush_success = now
-            self._last_flush_error = None
-            LAST_FLUSH_SUCCESS_TIMESTAMP.set(now)
-            EVENTS_PROCESSED.inc(len(batch))
-            self._refresh_readiness()
-            # Signal the main consumer-loop thread that it's now safe to
-            # advance committed Kafka offsets past these events (they are
-            # durably in the DB and on disk). Set here so this covers both
-            # a size-triggered flush (main thread) and a timeout-triggered
-            # flush (background flush-timer thread) -- threading.Event is
-            # itself thread-safe, so this needs no lock.
-            self._commit_pending.set()
-
-        except Exception as e:
-            self._last_flush_error = type(e).__name__
-            FLUSH_FAILURES.inc()
-            self.logger.error(
-                "Batch flush failed; batch remains pending",
-                exc_info=True,
-                extra=log_extra(
-                    batch_size=len(batch),
-                    error_type=type(e).__name__,
+        tracing = self._get_tracing()
+        # A batch can contain events from many traces, so it is a root span
+        # with links instead of a child of whichever event happened to
+        # trigger the size-based flush.  Root spans ignore the process
+        # event span still attached by process_message().
+        with tracing.start_root_span(
+            "ash.consumer.flush_batch",
+            attributes={
+                "ash.batch_size": len(batch),
+                "ash.database_enabled": bool(
+                    self.config.get("database_enabled", False)
                 ),
-            )
-            # Re-add failed batch for retry. Its offset is deliberately
-            # left uncommitted, so PostgreSQL failure blocks progress
-            # instead of creating a permanent gap in the API's data.
-            with self.batch_lock:
-                self.batch_buffer = batch + self.batch_buffer
-                self.batch_raw_texts = raw_texts + self.batch_raw_texts
-                BATCH_SIZE_GAUGE.set(len(self.batch_buffer))
-            EVENTS_FAILED.labels(reason="flush_error").inc()
-            self._refresh_readiness()
+            },
+            links=tracing.links_for_events(batch),
+        ) as flush_span:
+            try:
+                # PostgreSQL first. If it is unavailable, the batch stays in
+                # memory and its Kafka offset is not committed; the broker will
+                # replay it after a crash. Writing the local JSONL first would
+                # duplicate lines on every retry while the database is down.
+                if self.config.get("database_enabled", False):
+                    with tracing.start_span(
+                        "ash.db.insert_events",
+                        attributes={"ash.batch_size": len(batch)},
+                    ):
+                        self._write_database_batch(batch, raw_texts)
+
+                self._write_file_batch(batch)
+
+                now = time.time()
+                self.last_flush = now
+                self._last_flush_success = now
+                self._last_flush_error = None
+                LAST_FLUSH_SUCCESS_TIMESTAMP.set(now)
+                EVENTS_PROCESSED.inc(len(batch))
+                self._refresh_readiness()
+                flush_span.set_attribute("ash.flush.outcome", "ok")
+                # Signal the main consumer-loop thread that it's now safe to
+                # advance committed Kafka offsets past these events (they are
+                # durably in the DB and on disk). Set here so this covers both
+                # a size-triggered flush (main thread) and a timeout-triggered
+                # flush (background flush-timer thread) -- threading.Event is
+                # itself thread-safe, so this needs no lock.
+                self._commit_pending.set()
+
+            except Exception as e:
+                self._last_flush_error = type(e).__name__
+                flush_span.record_exception(e)
+                flush_span.set_attribute("ash.flush.outcome", "error")
+                FLUSH_FAILURES.inc()
+                self.logger.error(
+                    "Batch flush failed; batch remains pending",
+                    exc_info=True,
+                    extra=log_extra(
+                        batch_size=len(batch),
+                        error_type=type(e).__name__,
+                    ),
+                )
+                # Re-add failed batch for retry. Its offset is deliberately
+                # left uncommitted, so PostgreSQL failure blocks progress
+                # instead of creating a permanent gap in the API's data.
+                with self.batch_lock:
+                    self.batch_buffer = batch + self.batch_buffer
+                    self.batch_raw_texts = raw_texts + self.batch_raw_texts
+                    BATCH_SIZE_GAUGE.set(len(self.batch_buffer))
+                EVENTS_FAILED.labels(reason="flush_error").inc()
+                self._refresh_readiness()
 
         BATCH_FLUSH_LATENCY.observe(time.time() - start_time)
 
@@ -1347,38 +1438,43 @@ class ASHConsumer:
 
         # Bulk insert command events
         if command_events:
-            values = [
-                (
-                    e.get("event_id"),
-                    e.get("schema_version", "1.0"),
-                    e.get("hostname", "unknown"),
-                    e.get("source", "unknown"),
-                    e.get("event_type", "unknown"),
-                    e.get("user", e.get("username", "")),
-                    e.get("uid"),
-                    e.get("session_id"),
-                    e.get("pid"),
-                    e.get("ppid"),
-                    e.get("tty"),
-                    e.get("command", ""),
-                    e.get("cwd"),
-                    e.get("exit_code"),
-                    e.get("duration_ms"),
-                    e.get("stdout", e.get("output", "")),
-                    e.get("file_path"),
-                    e.get("diff_content"),
-                    e.get("ssh_connection"),
-                    e.get("container_id"),
-                    e.get("container_name"),
-                    e.get("risk_score", 0),
-                    e.get("prev_hash"),
-                    e.get("event_hash"),
-                    json.dumps(e, default=str),
-                    raw_text,
-                    e.get("timestamp"),
+            values = []
+            for e, raw_text in command_events:
+                trace = trace_columns(e)
+                values.append(
+                    (
+                        e.get("event_id"),
+                        e.get("schema_version", "1.0"),
+                        e.get("hostname", "unknown"),
+                        e.get("source", "unknown"),
+                        e.get("event_type", "unknown"),
+                        e.get("user", e.get("username", "")),
+                        e.get("uid"),
+                        e.get("session_id"),
+                        e.get("pid"),
+                        e.get("ppid"),
+                        e.get("tty"),
+                        e.get("command", ""),
+                        e.get("cwd"),
+                        e.get("exit_code"),
+                        e.get("duration_ms"),
+                        e.get("stdout", e.get("output", "")),
+                        e.get("file_path"),
+                        e.get("diff_content"),
+                        e.get("ssh_connection"),
+                        e.get("container_id"),
+                        e.get("container_name"),
+                        e.get("risk_score", 0),
+                        trace["trace_id"],
+                        trace["span_id"],
+                        trace["parent_span_id"],
+                        e.get("prev_hash"),
+                        e.get("event_hash"),
+                        json.dumps(e, default=str),
+                        raw_text,
+                        e.get("timestamp"),
+                    )
                 )
-                for e, raw_text in command_events
-            ]
             execute_values(
                 cursor,
                 """INSERT INTO command_logs
@@ -1386,6 +1482,7 @@ class ASHConsumer:
                  username, uid, session_id, pid, ppid, tty, command, cwd,
                  exit_code, duration_ms, stdout, file_path, diff_content,
                  ssh_connection, container_id, container_name, risk_score,
+                 trace_id, span_id, parent_span_id,
                  prev_hash, event_hash, raw_event, raw_event_text,
                  log_timestamp)
                 VALUES %s
@@ -1393,7 +1490,7 @@ class ASHConsumer:
                 values,
                 template="""(%s, %s, %s, %s, %s, %s, %s, %s::uuid, %s, %s,
                              %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                             %s, %s, %s, %s::jsonb, %s, %s::timestamp)""",
+                             %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::timestamp)""",
             )
 
         # Bulk insert file-change events. file_events was already classified
@@ -1659,6 +1756,19 @@ class ASHConsumer:
             self.consumer.close()
         if self.db_conn:
             self.db_conn.close()
+
+        # Flush queued spans before the process exits.  Shutdown is
+        # best-effort: losing telemetry must never turn a clean stop into a
+        # failed one.
+        tracing = getattr(self, "tracing", None)
+        if tracing is not None:
+            try:
+                tracing.shutdown()
+            except Exception as e:  # noqa: BLE001 - telemetry is best-effort
+                self.logger.warning(
+                    "Tracing shutdown failed",
+                    extra=log_extra(error_type=type(e).__name__),
+                )
 
         self.logger.info("ASH Consumer stopped")
 
