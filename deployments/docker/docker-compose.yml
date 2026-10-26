@@ -83,6 +83,11 @@ services:
       ASH_TRACING_ENABLED: ${ASH_TRACING_ENABLED:-false}
       ASH_OTLP_ENDPOINT: ${ASH_OTLP_ENDPOINT:-}
       ASH_TRACING_SAMPLE_RATIO: ${ASH_TRACING_SAMPLE_RATIO:-1.0}
+      # OTLP log export is independent of tracing and disabled by default.
+      # Enabling it without ASH_OTLP_LOGS_ENDPOINT fails startup; the
+      # collector is added by the optional monitoring profile (PR 3).
+      ASH_LOG_OTLP_ENABLED: ${ASH_LOG_OTLP_ENABLED:-false}
+      ASH_OTLP_LOGS_ENDPOINT: ${ASH_OTLP_LOGS_ENDPOINT:-}
     volumes:
       - ash_logs:/var/log/ash
       - ash_archive:/var/archive/ash
@@ -130,6 +135,9 @@ services:
       ASH_TRACING_ENABLED: ${ASH_TRACING_ENABLED:-false}
       ASH_OTLP_ENDPOINT: ${ASH_OTLP_ENDPOINT:-}
       ASH_TRACING_SAMPLE_RATIO: ${ASH_TRACING_SAMPLE_RATIO:-1.0}
+      # Same independent OTLP log export switch as the consumer.
+      ASH_LOG_OTLP_ENABLED: ${ASH_LOG_OTLP_ENABLED:-false}
+      ASH_OTLP_LOGS_ENDPOINT: ${ASH_OTLP_LOGS_ENDPOINT:-}
     restart: unless-stopped
     healthcheck:
       # python:3.12-slim does not ship curl; use the interpreter the image

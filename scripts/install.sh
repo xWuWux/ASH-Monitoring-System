@@ -149,6 +149,7 @@ install_consumer() {
     # All are imported from /usr/local/lib/ash by the installed units.
     install -m 644 src/consumer/ash_observability.py "$INSTALL_DIR/lib/ash/"
     install -m 644 src/consumer/ash_tracing.py "$INSTALL_DIR/lib/ash/"
+    install -m 644 src/consumer/ash_log_export.py "$INSTALL_DIR/lib/ash/"
     install -m 644 src/consumer/gunicorn.conf.py "$INSTALL_DIR/lib/ash/"
 
     # Python dependencies

@@ -227,7 +227,9 @@ definitions, precedence rules, and security notes are in
 | `SpanHandle.record_exception(error)` (tracing) | any exception | no-op | Records only `exception.type` and ERROR status, never message/traceback |
 | `_ForcedIdGenerator` (tracing) | thread-local 128-bit trace / 64-bit span IDs | random non-zero | Emits the agent's exact IDs once; reports forced IDs as non-random |
 | `shutdown_tracing()`, `Tracing.shutdown()` (tracing) | no input; idempotent | no-op when disabled | Flush queued spans; failures are logged and swallowed |
-| `_register_tracing_shutdown()` (API) | no input; registers `atexit` | — | Flushes queued spans on normal gunicorn worker exit |
+| `configure_log_export(component)` (log export) | `ASH_LOG_OTLP_ENABLED` boolean; `ASH_OTLP_LOGS_ENDPOINT` absolute http(s) URL with host and no userinfo | disabled | Opt-in OTLP/HTTP log export; invalid config fails startup instead of silently dropping logs |
+| `LogExport.force_flush()`, `LogExport.shutdown()` (log export) | no input; idempotent | no-op when disabled | Flush queued records; failures are logged by type and swallowed |
+| `_register_telemetry_shutdown()` (API) | no input; registers log-export then tracing `atexit` handlers | — | Flushes queued telemetry on normal gunicorn worker exit (log export last) |
 | `watchdog_kick()`, `start_watchdog()` (agent) | no-op without `NOTIFY_SOCKET`; interval ≥ 1s | — | Heartbeat independent of command traffic |
 | `DB_AVAILABLE` (metric) | gauge, `0` or `1` | `1` after a successful write | Consumer database health signal |
 | `API_DATABASE_AVAILABLE` (metric) | gauge, `0` or `1`, `multiprocess_mode=max` | `0` until a readiness check succeeds | API database health signal |

@@ -37,6 +37,11 @@ Environment=ASH_METRICS_HOST=127.0.0.1
 # endpoint is a deliberate startup failure.
 Environment=ASH_TRACING_ENABLED=false
 Environment=ASH_TRACING_SAMPLE_RATIO=1.0
+# OTLP log export is independent of tracing and off by default. To enable
+# it, add ASH_LOG_OTLP_ENABLED=true and a full OTLP/HTTP logs URL in
+# ASH_OTLP_LOGS_ENDPOINT (for example http://127.0.0.1:4318/v1/logs) via a
+# drop-in. Enabling it without an endpoint is a deliberate startup failure.
+Environment=ASH_LOG_OTLP_ENABLED=false
 
 # Security hardening
 ProtectSystem=strict

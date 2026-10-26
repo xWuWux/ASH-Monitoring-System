@@ -298,10 +298,12 @@ def test_event_search_returns_trace_context_columns(
     assert "trace_id" not in count_query
 
 
-def test_api_registers_a_tracing_flush_on_normal_exit(api_module, monkeypatch):
+def test_api_registers_telemetry_flushes_on_normal_exit(api_module, monkeypatch):
     registered = []
     monkeypatch.setattr(api_module.atexit, "register", registered.append)
 
-    api_module._register_tracing_shutdown()
+    api_module._register_telemetry_shutdown()
 
-    assert registered == [api_module.shutdown_tracing]
+    # atexit is LIFO: tracing is registered last so it shuts down first and
+    # log export is still available to flush any shutdown warnings.
+    assert registered == [api_module.shutdown_log_export, api_module.shutdown_tracing]

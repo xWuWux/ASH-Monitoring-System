@@ -31,7 +31,10 @@ below.
    it can never drop, duplicate, or delay an event or an HTTP response.
 7. **No per-host OpenTelemetry runtime.** The agent emits portable W3C IDs and
    the consumer reconstructs the agent span. Only the consumer and API run an
-   OTel SDK, and only when tracing is explicitly enabled.
+   OTel SDK, and only when tracing or log export is explicitly enabled.
+8. **Central log export is opt-in and best-effort.** stdout remains
+   authoritative; a broken OTLP log exporter cannot fail or delay a request or
+   event, and it never removes the local line.
 
 ## Log schema
 
@@ -97,6 +100,29 @@ consumer's processing span is active.
 The consumer's file rotation is a standard `RotatingFileHandler`; it is not
 used on the agent's hash-chained event log. Truncating that chain would break
 the integrity proof.
+
+### Optional OTLP log export
+
+The consumer and API can additionally export application logs over OTLP/HTTP
+to the collector in the monitoring stack. This is **off by default** and is
+independent of tracing: operators can centralize logs without spans, or spans
+without logs.
+
+* stdout (and the consumer's bounded file) remains authoritative and is always
+  kept. A failed export never removes or delays the local line.
+* `ASH_LOG_OTLP_ENABLED` is the strict boolean flag; enabling it requires a
+  full `ASH_OTLP_LOGS_ENDPOINT` (http/https, host, no userinfo).
+* The OTel batch processor is asynchronous. Shutdown flushes with the
+  exporter's 5-second timeout; `SIGKILL`/worker timeouts lose queued records.
+* OTLP records use `service.name` as the resource and carry the same
+  allow-listed fields as JSON logs (`component`, `logger`, `pid`, request/event
+  correlation, and trace IDs). Exception records include only
+  `exception.type`, never the message or traceback.
+* `trace_id`/`span_id` come from the explicit record fields when both are
+  valid, otherwise from the active span. That is what makes a Loki line
+  clickable through to its Tempo trace.
+* No Alloy/Promtail, Docker-socket log tailing, or file tailing is used. The
+  agent still does not ship logs.
 
 ## Health endpoints
 
@@ -239,8 +265,8 @@ and calls `mark_process_dead()` when a worker exits.
 
 `scripts/install.sh` places the executable at `/usr/local/bin/ash-consumer`
 and the shared modules (`ash_observability.py`, `ash_tracing.py`,
-`ash_alerting.py`, `api_server.py`, `gunicorn.conf.py`) in
-`/usr/local/lib/ash`. The consumer adds that directory to `sys.path` before
+`ash_log_export.py`, `ash_alerting.py`, `api_server.py`,
+`gunicorn.conf.py`) in `/usr/local/lib/ash`. The consumer adds that directory to `sys.path` before
 importing its siblings, and the systemd unit also sets
 `PYTHONPATH=/usr/local/lib/ash:...`; running from a source checkout or the
 container, where the files are siblings, needs neither.
@@ -274,6 +300,8 @@ would silently point at the wrong broker, URL, or directory.
 | `ASH_TRACING_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = disabled | `false` | Enables OTLP span export; any other value fails startup |
 | `ASH_OTLP_ENDPOINT` | Absolute `http`/`https` URL with a host, no userinfo | empty | OTLP/HTTP traces URL; required when tracing is enabled |
 | `ASH_TRACING_SAMPLE_RATIO` | Finite number in `[0.0, 1.0]` | `1.0` | Trace-ID-ratio sampling; a sampled API parent still wins |
+| `ASH_LOG_OTLP_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = disabled | `false` | Exports application logs over OTLP/HTTP; independent of tracing |
+| `ASH_OTLP_LOGS_ENDPOINT` | Absolute `http`/`https` URL with a host, no userinfo | empty | OTLP/HTTP logs URL; required when log export is enabled |
 
 The JSON config keys `log_name`, `log_max_bytes`, `log_backup_count`,
 `metrics_host`, and `metrics_port` mirror these settings; see
@@ -290,6 +318,8 @@ The JSON config keys `log_name`, `log_max_bytes`, `log_backup_count`,
 | `ASH_TRACING_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = disabled | `false` | Enables OTLP span export; any other value fails startup |
 | `ASH_OTLP_ENDPOINT` | Absolute `http`/`https` URL with a host, no userinfo | empty | OTLP/HTTP traces URL; required when tracing is enabled |
 | `ASH_TRACING_SAMPLE_RATIO` | Finite number in `[0.0, 1.0]` | `1.0` | Trace-ID-ratio sampling for new traces; a sampled inbound `traceparent` wins |
+| `ASH_LOG_OTLP_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = disabled | `false` | Exports application logs over OTLP/HTTP; independent of tracing |
+| `ASH_OTLP_LOGS_ENDPOINT` | Absolute `http`/`https` URL with a host, no userinfo | empty | OTLP/HTTP logs URL; required when log export is enabled |
 | `PROMETHEUS_MULTIPROC_DIR` | Writable directory path | unset in single-process mode; `/tmp/ash-prometheus` in the image | Aggregates metrics across gunicorn workers |
 
 ### Agent and deployment

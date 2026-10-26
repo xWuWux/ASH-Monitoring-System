@@ -65,6 +65,7 @@ from ash_observability import (  # noqa: E402
     log_extra,
     sd_notify,
 )
+from ash_log_export import configure_log_export  # noqa: E402
 from ash_tracing import configure_tracing, trace_columns  # noqa: E402
 
 # ─── Prometheus Metrics ──────────────────────────────────────────────────────
@@ -399,6 +400,10 @@ class ASHConsumer:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self._setup_logging()
+        # OTLP log export is configured before any data path starts so an
+        # invalid configuration fails startup instead of silently dropping
+        # logs later.  It is independent of tracing and disabled by default.
+        self.log_export = configure_log_export("ash-consumer")
         # Tracing is configured before any data path starts so an invalid
         # configuration (enabled without an endpoint) fails startup instead
         # of silently dropping spans later.
@@ -1771,6 +1776,19 @@ class ASHConsumer:
                 )
 
         self.logger.info("ASH Consumer stopped")
+
+        # Flush the final log line to the collector.  Shutdown is
+        # best-effort and independent of tracing: a broken log exporter must
+        # never turn a clean stop into a failed one.
+        log_export = getattr(self, "log_export", None)
+        if log_export is not None:
+            try:
+                log_export.shutdown()
+            except Exception as e:  # noqa: BLE001 - telemetry is best-effort
+                self.logger.warning(
+                    "OTLP log export shutdown failed",
+                    extra=log_extra(error_type=type(e).__name__),
+                )
 
 
 if __name__ == "__main__":
