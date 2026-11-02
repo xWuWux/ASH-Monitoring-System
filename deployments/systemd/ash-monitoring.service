@@ -1,0 +1,49 @@
+[Unit]
+Description=ASH observability stack (Docker Compose monitoring profile)
+Documentation=https://github.com/xWuWux/ASH-Monitoring-System/blob/main/docs/OBSERVABILITY.md
+# Scope: this unit starts the six monitoring containers only. It is for a host
+# where ash-consumer and ash-api are Compose services in this project, because
+# the Prometheus config scrapes `ash-consumer:9090` and `ash-api:8080` over the
+# Compose network. It cannot scrape the native systemd units, which bind
+# 127.0.0.1; see issue #59. Do not enable this unit on a native-only host.
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# Opt-in: the file carries the Compose interpolation values and the validated
+# alert webhook / API metrics token consumed by the init script.
+ConditionPathExists=/etc/ash/monitoring.env
+ConditionPathExists=/usr/local/share/ash/deployments/docker/docker-compose.yml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/usr/local/share/ash/deployments/docker
+# Render the Alertmanager config, API metrics token, and Grafana password
+# before Compose starts. The script fails closed; a missing webhook or token
+# stops the unit instead of starting a stack with a null receiver or an
+# unauthenticated metrics endpoint.
+ExecStartPre=/usr/local/bin/ash-monitoring-init --env-file /etc/ash/monitoring.env
+# Name the six services explicitly: `--profile monitoring up -d` would also
+# start every service without a profile (Kafka, PostgreSQL, consumer, API),
+# which would duplicate a native install and can clash on port 8080.
+ExecStart=/usr/bin/docker compose --env-file /etc/ash/monitoring.env --profile monitoring up -d --wait --wait-timeout 300 otel-collector tempo loki prometheus alertmanager grafana
+# Stop only the monitoring services. `docker compose down` would tear down the
+# whole project, including an unrelated consumer/API/Kafka/PostgreSQL stack.
+ExecStop=/usr/bin/docker compose --env-file /etc/ash/monitoring.env --profile monitoring stop otel-collector tempo loki prometheus alertmanager grafana
+ExecReload=/usr/bin/docker compose --env-file /etc/ash/monitoring.env --profile monitoring up -d --wait --wait-timeout 300 otel-collector tempo loki prometheus alertmanager grafana
+TimeoutStartSec=600
+TimeoutStopSec=180
+
+# The unit needs the Docker socket and read access to the installed Compose
+# assets. It never needs a writable system directory; containers write to the
+# bind-mounted state directories prepared by monitoring-init.sh.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# Docker Compose reads the project directory; keep the unit's own view of the
+# host minimal without blocking the Docker socket or the state bind mounts.
+ReadOnlyPaths=/usr/local/share/ash /etc/ash
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,70 @@
+# ASH OpenTelemetry Collector
+#
+# Receives OTLP/HTTP traces and logs from the consumer/API, then fans out:
+#   traces -> Tempo (OTLP/gRPC)
+#   logs   -> Loki   (OTLP/HTTP)
+#
+# The collector is internal to the monitoring profile. Only 4317/4318 are
+# published, and only on loopback by default. There is no file tailing,
+# Docker-socket access, or Alloy/Promtail.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Bound memory before the exporters can queue without limit. The limits are
+  # deliberately small for a single-host stack; raise them together with the
+  # container memory limit.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    timeout: 10s
+
+  # The otlphttp exporter appends /v1/logs, producing
+  # http://loki:3100/otlp/v1/logs, which is Loki's OTLP ingestion path.
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    timeout: 10s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 127.0.0.1:1777
+
+service:
+  extensions: [health_check, pprof]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/loki]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888

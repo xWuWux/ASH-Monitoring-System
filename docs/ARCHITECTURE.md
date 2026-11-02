@@ -122,7 +122,7 @@ timestamp.
 Agent logs stay local and append-only; agent events reach the central server
 through Kafka. See `docs/OBSERVABILITY.md` for the schema, metrics,
 environment-variable domains, trace model, and security rules. The
-Grafana/Tempo/Loki/Prometheus stack is delivered in PR 3.
+Grafana/Tempo/Loki/Prometheus stack is an optional Compose profile.
 
 ## Event Schema (v1.0)
 

@@ -1,0 +1,156 @@
+# ASH alert rules.
+#
+# runbook_url currently points at the operations-runbook issue (#57). Replace
+# each anchor with docs/OPERATIONS_RUNBOOK.md#<section> when that document
+# lands; do not ship an alert without a runbook.
+groups:
+  - name: ash-consumer
+    rules:
+      - alert: AshConsumerNotReady
+        expr: ash_consumer_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: consumer
+        annotations:
+          summary: "ASH consumer is not ready"
+          description: "The consumer readiness gauge has been 0 for 2 minutes. Check PostgreSQL, Kafka, and the last flush error."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+      - alert: AshConsumerDatabaseUnavailable
+        expr: ash_consumer_database_available == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: consumer
+        annotations:
+          summary: "ASH consumer cannot write to PostgreSQL"
+          description: "The database-available gauge has been 0 for 2 minutes. Ingestion is stalled and offsets are not being committed."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+      - alert: AshConsumerFlushStalled
+        expr: (time() - ash_consumer_last_flush_success_timestamp_seconds > 300) and (ash_consumer_last_flush_success_timestamp_seconds > 0)
+        for: 5m
+        labels:
+          severity: critical
+          component: consumer
+        annotations:
+          summary: "ASH consumer has not flushed for 5 minutes"
+          description: "The last successful durable flush is older than 5 minutes. Check database health, flush failures, and Kafka lag."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+      - alert: AshConsumerFlushFailures
+        expr: increase(ash_consumer_flush_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: consumer
+        annotations:
+          summary: "ASH consumer flush failures"
+          description: "At least one flush left data pending in the last 5 minutes. Events remain buffered and the offset is not committed."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+  - name: ash-api
+    rules:
+      - alert: AshApiDatabaseUnavailable
+        expr: ash_api_database_available == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "ASH API cannot reach PostgreSQL"
+          description: "The API database-available gauge has been 0 for 2 minutes. Readiness returns 503 and authenticated queries fail."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+      - alert: AshApiErrorRate
+        expr: |
+          (
+            sum(rate(ash_api_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(ash_api_requests_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(ash_api_requests_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "ASH API 5xx rate is above 5%"
+          description: "More than 5% of API requests returned 5xx for 5 minutes. Check database availability, latency, and recent deploys."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+      - alert: AshApiHighLatency
+        expr: histogram_quantile(0.95, sum by (le) (rate(ash_api_request_duration_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "ASH API p95 latency is above 1s"
+          description: "The p95 request latency has exceeded 1 second for 10 minutes. Check PostgreSQL connections, slow queries, and worker saturation."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+  - name: ash-platform
+    rules:
+      - alert: AshTargetDown
+        expr: up{job=~"prometheus|otel-collector|tempo|loki|alertmanager|grafana|ash-consumer|ash-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: monitoring
+        annotations:
+          summary: "ASH monitoring target is down"
+          description: "Prometheus cannot scrape {{ $labels.job }} ({{ $labels.instance }}). Check the container/service and its health endpoint."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+      - alert: AshCollectorTelemetryExportFailures
+        expr: |
+          increase(otelcol_exporter_send_failed_log_records_total[5m]) > 0
+          or
+          increase(otelcol_exporter_send_failed_spans_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: collector
+        annotations:
+          summary: "ASH collector cannot export telemetry"
+          description: "The collector failed to send logs or spans to Tempo/Loki in the last 5 minutes. Check the downstream service and collector queue."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+      - alert: AshCollectorRefusedTelemetry
+        expr: |
+          increase(otelcol_receiver_refused_log_records_total[5m]) > 0
+          or
+          increase(otelcol_receiver_refused_spans_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: collector
+        annotations:
+          summary: "ASH collector refused telemetry"
+          description: "The collector refused logs or spans in the last 5 minutes, usually because its queue or memory limiter is saturated."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+      - alert: AshCollectorQueueNearFull
+        expr: otelcol_exporter_queue_size / otelcol_exporter_queue_capacity > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: collector
+        annotations:
+          summary: "ASH collector export queue is above 80%"
+          description: "The collector exporter queue is nearly full. Increase resources or fix the downstream Tempo/Loki endpoint."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+      - alert: AshAlertmanagerDeliveryFailures
+        expr: increase(alertmanager_notifications_failed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: alertmanager
+        annotations:
+          summary: "ASH Alertmanager cannot deliver notifications"
+          description: "Alertmanager failed to deliver at least one notification in the last 5 minutes. Check the receiver webhook and network."
+          runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
