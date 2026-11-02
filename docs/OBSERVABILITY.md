@@ -1,10 +1,11 @@
 # ASH Observability
 
-This document covers the observability foundation delivered in PR 1
-(structured logs, request/event correlation, health signals, and Prometheus
-metrics) and distributed tracing delivered in PR 2. The Grafana/Tempo/Loki
-monitoring stack is delivered in PR 3 and is not required for the behavior
-below.
+This document covers the observability foundation (structured logs,
+request/event correlation, health signals, and Prometheus metrics),
+distributed tracing, and the optional
+Grafana/Tempo/Loki/Prometheus/Collector/Alertmanager stack. The stack is off
+unless the `monitoring` Compose profile is selected; the application behavior
+below does not depend on it.
 
 ## Design rules
 
@@ -31,7 +32,10 @@ below.
    it can never drop, duplicate, or delay an event or an HTTP response.
 7. **No per-host OpenTelemetry runtime.** The agent emits portable W3C IDs and
    the consumer reconstructs the agent span. Only the consumer and API run an
-   OTel SDK, and only when tracing is explicitly enabled.
+   OTel SDK, and only when tracing or log export is explicitly enabled.
+8. **Central log export is opt-in and best-effort.** stdout remains
+   authoritative; a broken OTLP log exporter cannot fail or delay a request or
+   event, and it never removes the local line.
 
 ## Log schema
 
@@ -97,6 +101,29 @@ consumer's processing span is active.
 The consumer's file rotation is a standard `RotatingFileHandler`; it is not
 used on the agent's hash-chained event log. Truncating that chain would break
 the integrity proof.
+
+### Optional OTLP log export
+
+The consumer and API can additionally export application logs over OTLP/HTTP
+to the collector in the monitoring stack. This is **off by default** and is
+independent of tracing: operators can centralize logs without spans, or spans
+without logs.
+
+* stdout (and the consumer's bounded file) remains authoritative and is always
+  kept. A failed export never removes or delays the local line.
+* `ASH_LOG_OTLP_ENABLED` is the strict boolean flag; enabling it requires a
+  full `ASH_OTLP_LOGS_ENDPOINT` (http/https, host, no userinfo).
+* The OTel batch processor is asynchronous. Shutdown flushes with the
+  exporter's 5-second timeout; `SIGKILL`/worker timeouts lose queued records.
+* OTLP records use `service.name` as the resource and carry the same
+  allow-listed fields as JSON logs (`component`, `logger`, `pid`, request/event
+  correlation, and trace IDs). Exception records include only
+  `exception.type`, never the message or traceback.
+* `trace_id`/`span_id` come from the explicit record fields when both are
+  valid, otherwise from the active span. That is what makes a Loki line
+  clickable through to its Tempo trace.
+* No Alloy/Promtail, Docker-socket log tailing, or file tailing is used. The
+  agent still does not ship logs.
 
 ## Health endpoints
 
@@ -186,6 +213,154 @@ part of the full row.
   worker exit. `SIGKILL`/worker timeouts lose queued spans; that is accepted
   best-effort behavior, not a data-loss path for events.
 
+## Monitoring stack (optional)
+
+The in-repo stack is a Compose profile, not a required dependency. It consumes
+the signals above and adds no instrumentation to the agent or the data path.
+
+> **Deployment boundary.** The profile is validated for the Compose
+> deployment, where `ash-consumer` and `ash-api` are Compose services and
+> Prometheus can resolve those names. The native systemd consumer/API units
+> bind `127.0.0.1`, which a container cannot scrape; see issue #59. Do not
+> enable `ash-monitoring.service` on a native-only host until that issue is
+> resolved.
+
+| Service | Pinned image | Internal port | Host binding | Purpose |
+|---------|--------------|---------------|--------------|---------|
+| OpenTelemetry Collector | `otel/opentelemetry-collector-contrib:0.115.1` | 4317/gRPC, 4318/HTTP, 8888/metrics, 13133/health | `127.0.0.1:4317`, `127.0.0.1:4318` | OTLP ingress and fan-out to Tempo/Loki |
+| Tempo | `grafana/tempo:2.6.1` | 3200/HTTP, 4317, 4318 | `127.0.0.1:3200` | Trace storage and TraceQL |
+| Loki | `grafana/loki:3.2.1` | 3100 | none | Log storage and LogQL |
+| Prometheus | `prom/prometheus:v2.55.1` | 9091 | `127.0.0.1:9091` | Metrics, alert rules, remote-write receiver for Tempo span metrics |
+| Alertmanager | `prom/alertmanager:v0.27.0` | 9093 | `127.0.0.1:9093` | Routing and deduplication |
+| Grafana | `grafana/grafana:11.3.1` | 3000 | `127.0.0.1:3000` | Dashboards and trace/log correlation |
+
+### Setup
+
+```bash
+cd deployments/docker
+cp .env.example .env
+# Fill ASH_DB_PASSWORD, ASH_JWT_SECRET, ASH_ADMIN_USER, ASH_ADMIN_PASS.
+# For the stack, also set:
+#   ASH_METRICS_ENABLED=true
+#   ASH_METRICS_TOKEN=<openssl rand -hex 32>
+#   ASH_ALERTMANAGER_WEBHOOK_URL=https://...
+#   ASH_GRAFANA_ADMIN_PASSWORD=<optional; generated when absent>
+
+# Renders alertmanager.yml, api_metrics_token, grafana_admin_password and
+# creates /var/lib/ash-monitoring/{prometheus,alertmanager,grafana,loki,tempo}.
+sudo ../../scripts/monitoring-init.sh --env-file .env
+
+# Start the six monitoring services. Name them explicitly so this does not
+# start a second consumer/API or Kafka/PostgreSQL on a native host.
+sudo docker compose --env-file .env --profile monitoring up -d --wait \
+  otel-collector tempo loki prometheus alertmanager grafana
+```
+
+`monitoring-init.sh` parses the env file as data (it never sources it), refuses
+a missing/invalid webhook or metrics token, and writes secrets `0600` owned by
+the container UIDs. The runtime directory is `0711` so those UIDs can reach
+their own file without listing the others. The default locations are
+`/var/lib/ash-monitoring/runtime` and `/var/lib/ash-monitoring`; override them
+with `ASH_MONITORING_RUNTIME_DIR` / `ASH_MONITORING_DATA_DIR` in both the init
+script and Compose.
+
+Enable tracing and/or OTLP log export on the consumer/API only when the
+collector is running:
+
+```dotenv
+ASH_TRACING_ENABLED=true
+ASH_OTLP_ENDPOINT=http://otel-collector:4318/v1/traces
+ASH_LOG_OTLP_ENABLED=true
+ASH_OTLP_LOGS_ENDPOINT=http://otel-collector:4318/v1/logs
+```
+
+Both remain best-effort: a collector outage never changes event/request
+success, and stdout logging is always kept.
+
+The stack-specific inputs consumed by `monitoring-init.sh` are:
+
+| Variable | Domain | Default | Effect |
+|----------|--------|---------|--------|
+| `ASH_METRICS_ENABLED` | Boolean (`1/true/yes/on` or `0/false/no/off`) | `false` | Must be true for the stack; the init script refuses a disabled endpoint |
+| `ASH_METRICS_TOKEN` | 16+ characters from `[A-Za-z0-9._~+/=-]` | empty | API bearer token; rendered `0600` for Prometheus and never committed |
+| `ASH_ALERTMANAGER_WEBHOOK_URL` | Absolute `http`/`https` URL with a host; no userinfo, quotes, backslashes, or control characters | empty (required) | Rendered into Alertmanager's `0600` config; a missing value fails closed rather than shipping a null receiver |
+| `ASH_GRAFANA_ADMIN_PASSWORD` | 12+ characters with no control characters | random base64 password | Grafana `admin` password; written `0600` and printed only as a file path |
+| `ASH_MONITORING_RUNTIME_DIR` | Absolute path, not `/` | `/var/lib/ash-monitoring/runtime` | Directory for rendered secrets (mode `0711`, files `0600`) |
+| `ASH_MONITORING_DATA_DIR` | Absolute path, not `/` | `/var/lib/ash-monitoring` | Parent of the service state directories (each `0750`) |
+
+Use the same two directory overrides in the env file and in any manual
+`docker compose` invocation. The `ASH_METRICS_TOKEN` validation above is
+stricter than the API's own non-empty check: it rejects values that would
+break the `Authorization: Bearer` header or the credentials file.
+
+### Retention and storage
+
+| Store | Retention | Notes |
+|-------|-----------|-------|
+| Prometheus TSDB | 15 days (`--storage.tsdb.retention.time=15d`) | Local disk only |
+| Tempo blocks | 48 hours (`block_retention`) | Local filesystem, no object storage |
+| Loki | 168 hours (`retention_period`) | Filesystem/TSDB, compactor deletes expired chunks |
+
+These are single-host presets, not long-term retention. The state directories
+are not size-capped; disk capacity and resource limits are tracked in #56.
+Backups of the monitoring state are not part of #51's application-data scope;
+Prometheus/Tempo/Loki are reconstructible telemetry, not the audit record.
+
+### Correlation
+
+* A consumer/API log line carries `trace_id` and `span_id` when a span is
+  active or the record has explicit allow-listed trace fields. Loki's
+  `derivedFields` links the same `trace_id` to the exact Tempo trace; Tempo's
+  `tracesToLogsV2` links back to Loki with a one-hour window.
+* Prometheus scrapes the consumer's internal `/metrics` directly and the API's
+  `/metrics` with a bearer token read from the `0600`
+  `api_metrics_token` file. The token is never embedded in the committed
+  Prometheus config.
+* Tempo's metrics generator remote-writes service-graph and span metrics to
+  Prometheus; the `ASH Traces & Logs` dashboard uses them.
+* The `ASH Overview` dashboard covers consumer readiness, flush freshness,
+  Kafka lag, API error rate/latency, dead letters, and scrape health.
+
+### Alerts and systemd
+
+Alert rules cover consumer readiness/database/flush health, API database/error
+rate/latency, target down, collector refused/failed telemetry, and
+Alertmanager delivery failures. Until `docs/OPERATIONS_RUNBOOK.md` lands, every
+`runbook_url` points at #57; do not treat an alert as actionable without that
+mapping.
+
+`deployments/systemd/ash-monitoring.service` is a single wrapper around the
+Compose profile for a Compose deployment:
+
+```bash
+sudo install -m 600 deployments/docker/.env /etc/ash/monitoring.env
+sudo systemctl enable --now ash-monitoring
+```
+
+The unit runs `monitoring-init.sh` as `ExecStartPre`, starts only the six
+monitoring services (not Kafka/PostgreSQL/consumer/API), and stops only those
+services. It requires `/etc/ash/monitoring.env` and the installed assets under
+`/usr/local/share/ash`; `scripts/install.sh` installs them but does not enable
+the unit.
+
+### Validation
+
+```bash
+# Static checks only (no image pulls, no stack start)
+./scripts/validate-monitoring.sh --compose-only
+
+# Full schema checks with the pinned images (promtool, amtool, loki, tempo,
+# collector) plus Grafana JSON and init fail-closed behavior
+./scripts/validate-monitoring.sh
+
+# Compose interpolation and profile wiring
+cd deployments/docker
+sudo docker compose --profile monitoring config --quiet
+```
+
+The `monitoring-config` CI job runs the same script. It validates configuration
+and rule-unit tests; it does not start the stack or prove end-to-end ingestion.
+
 ## Metrics
 
 ### Consumer
@@ -239,8 +414,8 @@ and calls `mark_process_dead()` when a worker exits.
 
 `scripts/install.sh` places the executable at `/usr/local/bin/ash-consumer`
 and the shared modules (`ash_observability.py`, `ash_tracing.py`,
-`ash_alerting.py`, `api_server.py`, `gunicorn.conf.py`) in
-`/usr/local/lib/ash`. The consumer adds that directory to `sys.path` before
+`ash_log_export.py`, `ash_alerting.py`, `api_server.py`,
+`gunicorn.conf.py`) in `/usr/local/lib/ash`. The consumer adds that directory to `sys.path` before
 importing its siblings, and the systemd unit also sets
 `PYTHONPATH=/usr/local/lib/ash:...`; running from a source checkout or the
 container, where the files are siblings, needs neither.
@@ -274,6 +449,8 @@ would silently point at the wrong broker, URL, or directory.
 | `ASH_TRACING_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = disabled | `false` | Enables OTLP span export; any other value fails startup |
 | `ASH_OTLP_ENDPOINT` | Absolute `http`/`https` URL with a host, no userinfo | empty | OTLP/HTTP traces URL; required when tracing is enabled |
 | `ASH_TRACING_SAMPLE_RATIO` | Finite number in `[0.0, 1.0]` | `1.0` | Trace-ID-ratio sampling; a sampled API parent still wins |
+| `ASH_LOG_OTLP_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = disabled | `false` | Exports application logs over OTLP/HTTP; independent of tracing |
+| `ASH_OTLP_LOGS_ENDPOINT` | Absolute `http`/`https` URL with a host, no userinfo | empty | OTLP/HTTP logs URL; required when log export is enabled |
 
 The JSON config keys `log_name`, `log_max_bytes`, `log_backup_count`,
 `metrics_host`, and `metrics_port` mirror these settings; see
@@ -290,6 +467,8 @@ The JSON config keys `log_name`, `log_max_bytes`, `log_backup_count`,
 | `ASH_TRACING_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = disabled | `false` | Enables OTLP span export; any other value fails startup |
 | `ASH_OTLP_ENDPOINT` | Absolute `http`/`https` URL with a host, no userinfo | empty | OTLP/HTTP traces URL; required when tracing is enabled |
 | `ASH_TRACING_SAMPLE_RATIO` | Finite number in `[0.0, 1.0]` | `1.0` | Trace-ID-ratio sampling for new traces; a sampled inbound `traceparent` wins |
+| `ASH_LOG_OTLP_ENABLED` | `1/true/yes/on` or `0/false/no/off`; unset = disabled | `false` | Exports application logs over OTLP/HTTP; independent of tracing |
+| `ASH_OTLP_LOGS_ENDPOINT` | Absolute `http`/`https` URL with a host, no userinfo | empty | OTLP/HTTP logs URL; required when log export is enabled |
 | `PROMETHEUS_MULTIPROC_DIR` | Writable directory path | unset in single-process mode; `/tmp/ash-prometheus` in the image | Aggregates metrics across gunicorn workers |
 
 ### Agent and deployment

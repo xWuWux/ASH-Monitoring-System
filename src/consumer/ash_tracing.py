@@ -737,21 +737,23 @@ class Tracing:
 _active_tracing: Optional[Tracing] = None
 
 
-def _validate_endpoint(endpoint: str) -> str:
-    """Validate an OTLP/HTTP traces endpoint.
+def _validate_endpoint(endpoint: str, name: str = "ASH_OTLP_ENDPOINT") -> str:
+    """Validate an OTLP/HTTP endpoint.
 
     Domain: non-empty absolute ``http``/``https`` URL with a host.  Path and
     query are preserved.  Userinfo is rejected because it would put a
-    credential in configuration/logs.  Raises ``RuntimeError`` on failure.
+    credential in configuration/logs.  ``name`` is the environment variable
+    named in the error, so the logs exporter can reuse the same checks.
+    Raises ``RuntimeError`` on failure.
     """
     parsed = urlsplit(endpoint)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise RuntimeError(
-            "ASH_OTLP_ENDPOINT must be an http(s) URL with a host, "
+            f"{name} must be an http(s) URL with a host, "
             "for example http://127.0.0.1:4318/v1/traces"
         )
     if parsed.username or parsed.password:
-        raise RuntimeError("ASH_OTLP_ENDPOINT must not contain credentials")
+        raise RuntimeError(f"{name} must not contain credentials")
     return endpoint
 
 

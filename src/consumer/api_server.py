@@ -40,6 +40,7 @@ from ash_observability import (
     new_request_id,
     sanitize_request_id,
 )
+from ash_log_export import configure_log_export, shutdown_log_export
 from ash_tracing import configure_tracing, shutdown_tracing
 
 
@@ -80,6 +81,11 @@ logger = configure_logging(
     log_name=f"api-{os.getpid()}.log",
 )
 
+# Validate OTLP log export at import time for the same reason as tracing: an
+# enabled exporter without an endpoint is a configuration error, not a silent
+# drop of every log.  Disabled export is a no-op and does not import the SDK.
+_LOG_EXPORT = configure_log_export("ash-api")
+
 # Validate tracing configuration at import time: enabling it without an
 # endpoint is a startup error, not a silent drop of every span.  Disabled
 # tracing is a no-op and does not require the OpenTelemetry SDK to be
@@ -87,19 +93,22 @@ logger = configure_logging(
 _TRACING = configure_tracing("ash-api")
 
 
-def _register_tracing_shutdown() -> None:
-    """Flush this worker's queued spans when it exits normally.
+def _register_telemetry_shutdown() -> None:
+    """Flush this worker's queued telemetry when it exits normally.
 
-    Domain: no input; registers a process ``atexit`` handler.  Gunicorn
+    Domain: no input; registers process ``atexit`` handlers.  Gunicorn
     workers exit through normal interpreter shutdown on SIGTERM/SIGQUIT, so
-    this is where a BatchSpanProcessor's queue is flushed.  SIGKILL and
-    worker timeouts cannot be handled; losing those spans is an accepted
-    best-effort failure, never a reason to fail the request.
+    this is where the batch processors' queues are flushed.  Log export is
+    registered first so it shuts down last (atexit is LIFO), after any log
+    emitted while tracing shuts down.  SIGKILL and worker timeouts cannot be
+    handled; losing that telemetry is an accepted best-effort failure, never
+    a reason to fail a request.
     """
+    atexit.register(shutdown_log_export)
     atexit.register(shutdown_tracing)
 
 
-_register_tracing_shutdown()
+_register_telemetry_shutdown()
 
 # Validate the metrics flag at import so a typo prevents startup instead of
 # silently leaving the endpoint disabled.

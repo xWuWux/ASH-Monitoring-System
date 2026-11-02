@@ -1,0 +1,133 @@
+rule_files:
+  - rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: consumer readiness fires after two minutes
+    interval: 1m
+    input_series:
+      - series: ash_consumer_ready
+        values: "0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AshConsumerNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: consumer
+            exp_annotations:
+              summary: "ASH consumer is not ready"
+              description: "The consumer readiness gauge has been 0 for 2 minutes. Check PostgreSQL, Kafka, and the last flush error."
+              runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+  - name: consumer readiness does not fire when ready
+    interval: 1m
+    input_series:
+      - series: ash_consumer_ready
+        values: "1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AshConsumerNotReady
+        exp_alerts: []
+
+  - name: consumer database outage fires
+    interval: 1m
+    input_series:
+      - series: ash_consumer_database_available
+        values: "0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AshConsumerDatabaseUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: consumer
+            exp_annotations:
+              summary: "ASH consumer cannot write to PostgreSQL"
+              description: "The database-available gauge has been 0 for 2 minutes. Ingestion is stalled and offsets are not being committed."
+              runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+  - name: api database outage fires
+    interval: 1m
+    input_series:
+      - series: ash_api_database_available
+        values: "0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AshApiDatabaseUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: api
+            exp_annotations:
+              summary: "ASH API cannot reach PostgreSQL"
+              description: "The API database-available gauge has been 0 for 2 minutes. Readiness returns 503 and authenticated queries fail."
+              runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+  - name: api error rate fires above five percent
+    interval: 1m
+    input_series:
+      - series: 'ash_api_requests_total{status="500"}'
+        values: "0+6x10"
+      - series: 'ash_api_requests_total{status="200"}'
+        values: "0+54x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AshApiErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: api
+            exp_annotations:
+              summary: "ASH API 5xx rate is above 5%"
+              description: "More than 5% of API requests returned 5xx for 5 minutes. Check database availability, latency, and recent deploys."
+              runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+  - name: api error rate does not fire below threshold
+    interval: 1m
+    input_series:
+      - series: 'ash_api_requests_total{status="500"}'
+        values: "0+1x10"
+      - series: 'ash_api_requests_total{status="200"}'
+        values: "0+99x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AshApiErrorRate
+        exp_alerts: []
+
+  - name: target down fires
+    interval: 1m
+    input_series:
+      - series: 'up{job="ash-consumer",instance="ash-consumer:9090"}'
+        values: "0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AshTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: monitoring
+              job: ash-consumer
+              instance: ash-consumer:9090
+            exp_annotations:
+              summary: "ASH monitoring target is down"
+              description: "Prometheus cannot scrape ash-consumer (ash-consumer:9090). Check the container/service and its health endpoint."
+              runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"
+
+  - name: collector export failure fires
+    interval: 1m
+    input_series:
+      - series: otelcol_exporter_send_failed_log_records_total
+        values: "0+1x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AshCollectorTelemetryExportFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: collector
+            exp_annotations:
+              summary: "ASH collector cannot export telemetry"
+              description: "The collector failed to send logs or spans to Tempo/Loki in the last 5 minutes. Check the downstream service and collector queue."
+              runbook_url: "https://github.com/xWuWux/ASH-Monitoring-System/issues/57"

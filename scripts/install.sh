@@ -149,6 +149,7 @@ install_consumer() {
     # All are imported from /usr/local/lib/ash by the installed units.
     install -m 644 src/consumer/ash_observability.py "$INSTALL_DIR/lib/ash/"
     install -m 644 src/consumer/ash_tracing.py "$INSTALL_DIR/lib/ash/"
+    install -m 644 src/consumer/ash_log_export.py "$INSTALL_DIR/lib/ash/"
     install -m 644 src/consumer/gunicorn.conf.py "$INSTALL_DIR/lib/ash/"
 
     # Python dependencies
@@ -176,6 +177,22 @@ install_services() {
     install -m 644 deployments/systemd/*.service "$SYSTEMD_DIR/"
     systemctl daemon-reload
     info "Systemd services installed"
+}
+
+install_monitoring() {
+    # The observability stack is opt-in and runs from the installed Compose
+    # assets, not from the source checkout. Only monitoring-init.sh is a
+    # supported installed command; validate-monitoring.sh stays a repo/CI
+    # tool because it expects the checkout layout.
+    install -m 755 scripts/monitoring-init.sh "$INSTALL_DIR/bin/ash-monitoring-init"
+    install -d "$SHARE_DIR/deployments/docker"
+    rm -rf "$SHARE_DIR/deployments/monitoring"
+    cp -a deployments/monitoring "$SHARE_DIR/deployments/"
+    install -m 644 deployments/docker/docker-compose.yml \
+        "$SHARE_DIR/deployments/docker/docker-compose.yml"
+    install -m 644 deployments/docker/.env.example \
+        "$SHARE_DIR/deployments/docker/.env.example"
+    info "Monitoring stack assets installed (opt-in; see docs/OBSERVABILITY.md)"
 }
 
 generate_api_secrets() {
@@ -281,6 +298,7 @@ do_install() {
     install_consumer
     install_configs
     install_services
+    install_monitoring
     generate_api_secrets
 
     header "Configuring shell integration"
@@ -293,11 +311,13 @@ do_uninstall() {
     check_root
     header "Uninstalling ASH"
 
-    systemctl stop ash-agent ash-consumer ash-api 2>/dev/null || true
-    systemctl disable ash-agent ash-consumer ash-api 2>/dev/null || true
+    systemctl stop ash-agent ash-consumer ash-api ash-monitoring 2>/dev/null || true
+    systemctl disable ash-agent ash-consumer ash-api ash-monitoring 2>/dev/null || true
 
     rm -f "$SYSTEMD_DIR/ash-agent.service" "$SYSTEMD_DIR/ash-consumer.service" "$SYSTEMD_DIR/ash-api.service"
+    rm -f "$SYSTEMD_DIR/ash-monitoring.service"
     rm -f "$INSTALL_DIR/bin/ash-agent" "$INSTALL_DIR/bin/ash-consumer"
+    rm -f "$INSTALL_DIR/bin/ash-monitoring-init"
     rm -rf "$INSTALL_DIR/lib/ash"
     rm -rf "$SHARE_DIR"
     rm -f /etc/profile.d/ash.sh
@@ -311,6 +331,7 @@ do_uninstall() {
 
     warn "Log directory preserved: $LOG_DIR"
     warn "Archive preserved: /var/archive/ash"
+    warn "Monitoring state preserved: /var/lib/ash-monitoring (remove manually after backup)"
     info "ASH uninstalled successfully"
 }
 
@@ -330,10 +351,12 @@ do_upgrade() {
     install_agent
     install_consumer
     install_services
+    install_monitoring
 
     # Restart
     systemctl start ash-agent 2>/dev/null || true
     systemctl start ash-consumer 2>/dev/null || true
+    systemctl try-restart ash-monitoring 2>/dev/null || true
 
     info "Upgrade complete. Restart services to apply."
 }

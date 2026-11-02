@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Every container's stdout is JSON where the service emits it, but Docker's
 # json-file driver is otherwise unbounded.  Cap each service so one noisy
 # incident cannot fill the host disk.
@@ -79,10 +77,15 @@ services:
       ASH_METRICS_HOST: "0.0.0.0"
       ASH_LOG_LEVEL: ${ASH_LOG_LEVEL:-INFO}
       # Tracing is opt-in. Enabling it without ASH_OTLP_ENDPOINT fails
-      # startup; the collector itself is added in PR 3.
+      # startup; the collector runs in the optional monitoring profile.
       ASH_TRACING_ENABLED: ${ASH_TRACING_ENABLED:-false}
       ASH_OTLP_ENDPOINT: ${ASH_OTLP_ENDPOINT:-}
       ASH_TRACING_SAMPLE_RATIO: ${ASH_TRACING_SAMPLE_RATIO:-1.0}
+      # OTLP log export is independent of tracing and disabled by default.
+      # Enabling it without ASH_OTLP_LOGS_ENDPOINT fails startup; the
+      # collector runs in the optional monitoring profile.
+      ASH_LOG_OTLP_ENABLED: ${ASH_LOG_OTLP_ENABLED:-false}
+      ASH_OTLP_LOGS_ENDPOINT: ${ASH_OTLP_LOGS_ENDPOINT:-}
     volumes:
       - ash_logs:/var/log/ash
       - ash_archive:/var/archive/ash
@@ -122,14 +125,17 @@ services:
       ASH_ADMIN_PASS: ${ASH_ADMIN_PASS:?Set ASH_ADMIN_PASS (see .env.example) — the old default was the publicly-known literal "admin"}
       ASH_API_PORT: "8080"
       ASH_LOG_LEVEL: ${ASH_LOG_LEVEL:-INFO}
-      # /metrics stays off until the monitoring stack (PR 3) sets both
-      # values. It is fail-closed: enabled without a token returns 401.
+      # /metrics stays off until the monitoring stack sets both values. It
+      # is fail-closed: enabled without a token returns 401.
       ASH_METRICS_ENABLED: ${ASH_METRICS_ENABLED:-false}
       ASH_METRICS_TOKEN: ${ASH_METRICS_TOKEN:-}
       # Same opt-in tracing configuration as the consumer.
       ASH_TRACING_ENABLED: ${ASH_TRACING_ENABLED:-false}
       ASH_OTLP_ENDPOINT: ${ASH_OTLP_ENDPOINT:-}
       ASH_TRACING_SAMPLE_RATIO: ${ASH_TRACING_SAMPLE_RATIO:-1.0}
+      # Same independent OTLP log export switch as the consumer.
+      ASH_LOG_OTLP_ENABLED: ${ASH_LOG_OTLP_ENABLED:-false}
+      ASH_OTLP_LOGS_ENDPOINT: ${ASH_OTLP_LOGS_ENDPOINT:-}
     restart: unless-stopped
     healthcheck:
       # python:3.12-slim does not ship curl; use the interpreter the image
@@ -139,6 +145,149 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
+
+  # ─── Optional observability stack ──────────────────────────────────────
+  # Everything below is off unless `--profile monitoring` is selected. Host
+  # ports bind to loopback; Loki and the collector/Tempo internal ports are
+  # reachable only on the Compose network. State lives in bind mounts rendered
+  # by scripts/monitoring-init.sh so the pinned images (which run as
+  # non-root UIDs) can write it.
+  otel-collector:
+    profiles: ["monitoring"]
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    logging: *default-logging
+    restart: unless-stopped
+    # The official collector image is distroless: it has no shell, wget, or
+    # curl, and the binary has no healthcheck subcommand. Do not fake one with
+    # `validate` (which would report healthy without proving the receiver is
+    # serving). Prometheus alerts on `up{job="otel-collector"} == 0` instead.
+    command: ["--config=/etc/otel/config.yml"]
+    volumes:
+      - ../monitoring/otel-collector/config.yml:/etc/otel/config.yml:ro
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      tempo:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+
+  tempo:
+    profiles: ["monitoring"]
+    image: grafana/tempo:2.6.1
+    logging: *default-logging
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    volumes:
+      - ../monitoring/tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - ${ASH_MONITORING_DATA_DIR:-/var/lib/ash-monitoring}/tempo:/var/tempo
+    ports:
+      - "127.0.0.1:3200:3200"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3200/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  loki:
+    profiles: ["monitoring"]
+    image: grafana/loki:3.2.1
+    logging: *default-logging
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ../monitoring/loki/loki.yml:/etc/loki/loki.yml:ro
+      - ${ASH_MONITORING_DATA_DIR:-/var/lib/ash-monitoring}/loki:/loki
+    # Not published: Grafana and the collector reach it on the Compose network.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:v2.55.1
+    logging: *default-logging
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      # Internal port matches the in-repo config and Tempo's remote-write URL.
+      - --web.listen-address=0.0.0.0:9091
+      # Tempo's metrics generator remote-writes span metrics/service graph.
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      # 0600 bearer token, owned by UID 65534 by monitoring-init.sh. It is
+      # never embedded in the committed Prometheus config.
+      - ${ASH_MONITORING_RUNTIME_DIR:-/var/lib/ash-monitoring/runtime}/api_metrics_token:/etc/prometheus/ash-api-token:ro
+      - ${ASH_MONITORING_DATA_DIR:-/var/lib/ash-monitoring}/prometheus:/prometheus
+    ports:
+      - "127.0.0.1:9091:9091"
+    depends_on:
+      alertmanager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9091/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  alertmanager:
+    profiles: ["monitoring"]
+    image: prom/alertmanager:v0.27.0
+    logging: *default-logging
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=0.0.0.0:9093
+    volumes:
+      - ${ASH_MONITORING_RUNTIME_DIR:-/var/lib/ash-monitoring/runtime}/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ${ASH_MONITORING_DATA_DIR:-/var/lib/ash-monitoring}/alertmanager:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9093/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:11.3.1
+    logging: *default-logging
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/ash-monitoring/grafana_admin_password
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ${ASH_MONITORING_RUNTIME_DIR:-/var/lib/ash-monitoring/runtime}/grafana_admin_password:/run/ash-monitoring/grafana_admin_password:ro
+      - ${ASH_MONITORING_DATA_DIR:-/var/lib/ash-monitoring}/grafana:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+      tempo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
 
 volumes:
   postgres_data:

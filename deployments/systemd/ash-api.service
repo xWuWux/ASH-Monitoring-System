@@ -36,6 +36,11 @@ Environment=ASH_METRICS_ENABLED=false
 # is a deliberate startup failure.
 Environment=ASH_TRACING_ENABLED=false
 Environment=ASH_TRACING_SAMPLE_RATIO=1.0
+# Same independent OTLP log export switch as the consumer. Add
+# ASH_LOG_OTLP_ENABLED=true and ASH_OTLP_LOGS_ENDPOINT to /etc/ash/api.env
+# to ship logs to the collector; enabling it without an endpoint fails
+# startup rather than silently dropping logs.
+Environment=ASH_LOG_OTLP_ENABLED=false
 
 # Placeholder default; override by adding ASH_DATABASE_URL to
 # /etc/ash/api.env once Postgres is provisioned (install.sh cannot
