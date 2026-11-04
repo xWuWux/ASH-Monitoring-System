@@ -60,6 +60,9 @@ jobs:
       - name: yamllint (workflows + compose)
         run: yamllint --strict .github/workflows deployments/docker/docker-compose.yml
 
+      - name: Release metadata validation
+        run: ./scripts/validate-release.sh
+
       - name: docker compose config
         run: docker compose -f deployments/docker/docker-compose.yml config --quiet
 
@@ -632,17 +635,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build installation archive
-        run: |
-          VERSION=$(grep 'ASH_VERSION=' src/agent/ash-agent.sh | head -1 | cut -d'"' -f2)
-          tar -czf "ash-monitor-${VERSION}.tar.gz" \
-            src/ config/ deployments/ scripts/ tests/ docs/
-          echo "Built: ash-monitor-${VERSION}.tar.gz"
+        run: ./scripts/build-release.sh --output-dir dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ash-monitor-package
-          path: ash-monitor-*.tar.gz
+          path: |
+            dist/ash-monitor-*.tar.gz
+            dist/SHA256SUMS
 
   # ── Capstone: everything required for merge passed ──────────────────────
   ci-success:

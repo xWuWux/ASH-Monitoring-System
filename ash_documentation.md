@@ -14,6 +14,7 @@
 7. [Security Considerations](#security-considerations)
 8. [Monitoring & Maintenance](#monitoring--maintenance)
 9. [Troubleshooting](#troubleshooting)
+10. [Releasing](#releasing)
 
 ---
 
@@ -63,7 +64,7 @@ The main monitoring script that runs on each target system.
 ```bash
 #!/bin/bash
 # ASH Agent - Complete Shell Monitoring System
-# Version: 2.0
+# Version: 2.2.0
 
 set -euo pipefail
 
@@ -795,7 +796,7 @@ volumes:
 #### 1. Package structure
 
 ```
-ash-monitor_2.0-1/
+ash-monitor_2.2.0/
 ├── DEBIAN/
 │   ├── control
 │   ├── postinst
@@ -823,7 +824,7 @@ ash-monitor_2.0-1/
 ```
 # DEBIAN/control
 Package: ash-monitor
-Version: 2.0-1
+Version: 2.2.0
 Section: admin
 Priority: optional
 Architecture: all
@@ -878,7 +879,7 @@ exit 0
 set -euo pipefail
 
 PACKAGE_NAME="ash-monitor"
-VERSION="2.0-1"
+VERSION="2.2.0"
 BUILD_DIR="build"
 
 # Create build directory
@@ -973,7 +974,7 @@ EXCLUDE_COMMANDS=(
 
 ```bash
 # Install and start ASH agent only
-sudo dpkg -i ash-monitor_2.0-1.deb
+sudo dpkg -i ash-monitor_2.2.0.deb
 sudo systemctl start ash-agent
 sudo systemctl status ash-agent
 ```
@@ -984,7 +985,7 @@ sudo systemctl status ash-agent
 
 ```bash
 # Install full package
-sudo dpkg -i ash-monitor_2.0-1.deb
+sudo dpkg -i ash-monitor_2.2.0.deb
 
 # Configure Kafka and PostgreSQL
 sudo systemctl start kafka
@@ -1003,7 +1004,7 @@ sudo systemctl start ash-consumer
 
 ```bash
 # Install agent only
-sudo dpkg -i ash-monitor_2.0-1.deb
+sudo dpkg -i ash-monitor_2.2.0.deb
 
 # Configure for central logging
 sudo tee /etc/ash/ash.conf << EOF
@@ -1780,6 +1781,20 @@ for message in consumer:
   }
 }
 ```
+
+---
+
+## Releasing
+
+ASH uses semantic-version tags and GitHub Releases. Pushing a `vX.Y.Z` tag
+runs the release workflow, which validates the tag against `ASH_VERSION` and
+`CHANGELOG.md`, builds a checksummed source archive, and publishes the
+matching changelog section as release notes. Published tags are never moved or
+deleted.
+
+See [docs/RELEASING.md](docs/RELEASING.md) for the release checklist,
+release-candidate and hotfix flows, rollback rules, and required repository
+settings.
 
 ---
 

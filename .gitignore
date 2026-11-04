@@ -11,6 +11,7 @@ __pycache__/
 .pytest_cache/
 coverage.xml
 .coverage
+dist/
 venv/
 .idea/
 .vscode/
