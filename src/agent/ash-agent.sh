@@ -3,33 +3,93 @@
 # Production-grade shell activity monitoring with structured events,
 # tamper-evident logging, crash recovery, and multi-layer monitoring.
 
-# Captured before we change any shell options below, so a failed init can
-# restore the *caller's* original options (see the dispatch logic at the
-# bottom of this file). This matters because `set -e`, once enabled here,
-# stays enabled in whatever shell sourced this file — and empirically,
-# `set -e` being active in the caller at the moment this file's own
-# `source` statement finishes is enough to kill that caller's shell on a
-# non-zero return, even though nothing past this point calls `exit`
-# directly. Restoring the caller's pre-source options on a failure path
-# is the only way to prevent that retroactively.
-_ASH_CALLER_SHELL_OPTS=$(set +o)
-
-set -euo pipefail
-set -T # functrace — inherit DEBUG/ERR traps into functions and subshells
-set -E # errtrace — inherit ERR trap into functions and subshells
+# This file is used in two very different ways:
+#
+#   1. Executed by systemd (`ExecStart=/usr/local/bin/ash-agent`), or run
+#      directly by an operator. It owns the process and may exit on error.
+#   2. `source`d from /etc/profile.d/ash.sh into a user's login shell, or
+#      from BASH_ENV into a child bash. It must never terminate or mutate
+#      the caller's shell options on *any* path, including failures.
+#
+# The original implementation enabled `set -euo pipefail` at file scope,
+# installed traps at file scope, and relied on `main()` returning non-zero
+# to disable monitoring. That is unsafe when sourced: errexit remains in the
+# caller after the file finishes, so the first unrelated failing command in
+# the user's shell exits it. It also made a failed validation look like a
+# caller failure, which is exactly the login-shell-death bug in issue #5.
+#
+# Do not use `$(set +o)` to capture caller options: command substitution
+# runs in a subshell where errexit is cleared unless `shopt -s
+# inherit_errexit` is set, so it silently records "errexit off" for a
+# caller that had it on. Capture the flags directly instead.
+_ASH_CALLER_ERREXIT=0
+[[ $- == *e* ]] && _ASH_CALLER_ERREXIT=1
+_ASH_CALLER_NOUNSET=0
+[[ $- == *u* ]] && _ASH_CALLER_NOUNSET=1
+_ASH_CALLER_PIPEFAIL=0
+[[ -o pipefail ]] && _ASH_CALLER_PIPEFAIL=1
+_ASH_CALLER_FUNCTRACE=0
+[[ $- == *T* ]] && _ASH_CALLER_FUNCTRACE=1
+_ASH_CALLER_ERRTRACE=0
+[[ $- == *E* ]] && _ASH_CALLER_ERRTRACE=1
+_ASH_CALLER_XTRACE=0
+[[ $- == *x* ]] && _ASH_CALLER_XTRACE=1
+_ASH_CALLER_NOGLOB=0
+[[ $- == *f* ]] && _ASH_CALLER_NOGLOB=1
+_ASH_CALLER_ALLEXPORT=0
+[[ $- == *a* ]] && _ASH_CALLER_ALLEXPORT=1
 
 readonly ASH_VERSION="2.2.0"
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 ASH_CONFIG_DIR="${ASH_CONFIG_DIR:-/etc/ash}"
 ASH_LOG_DIR="${ASH_LOG_DIR:-/var/log/ash}"
-ASH_TEMP_DIR="${ASH_TEMP_DIR:-/tmp/ash}"
+ASH_TEMP_DIR="${ASH_TEMP_DIR:-}"
 ASH_SPOOL_DIR="${ASH_SPOOL_DIR:-/var/spool/ash}"
-ASH_HASH_FILE="${ASH_LOG_DIR}/.hash_chain"
-ASH_STATE_FILE="${ASH_TEMP_DIR}/agent_state.json"
-ASH_AGENT_LOG="${ASH_LOG_DIR}/agent.log"
-ASH_EVENTS_FILE="${ASH_LOG_DIR}/events.jsonl"
+
+# Per-user fallback roots. The installer creates these as sticky,
+# write+execute-only directories (`1733`) so every local user can create
+# their own `$UID` subdirectory but cannot list or delete anyone else's.
+ASH_USER_LOG_ROOT="${ASH_USER_LOG_ROOT:-/var/log/ash/users}"
+ASH_USER_SPOOL_ROOT="${ASH_USER_SPOOL_ROOT:-/var/spool/ash/users}"
+
+# When true, an unwritable configured directory is a fatal error instead of
+# triggering the per-user fallback. The systemd unit sets this for the root
+# agent so a broken deployment fails loudly instead of silently writing to a
+# different location.
+ASH_STRICT_PERMISSIONS="${ASH_STRICT_PERMISSIONS:-false}"
+
+# Last-resort fallback when neither the configured directory nor the
+# per-user system directory is writable. This keeps monitoring alive for a
+# user whose host has no /var/log/ash at all; the resulting log is local to
+# that user and must be collected by root if it needs to be central.
+ASH_ALLOW_HOME_FALLBACK="${ASH_ALLOW_HOME_FALLBACK:-true}"
+
+# These are resolved from ASH_LOG_DIR/ASH_TEMP_DIR by ash_resolve_paths().
+# Tests and operators may override them explicitly; an explicit value is
+# preserved instead of being recomputed.
+ASH_HASH_FILE="${ASH_HASH_FILE:-}"
+ASH_STATE_FILE="${ASH_STATE_FILE:-}"
+ASH_AGENT_LOG="${ASH_AGENT_LOG:-}"
+ASH_EVENTS_FILE="${ASH_EVENTS_FILE:-}"
 ASH_REDACTION_CONFIG="${ASH_CONFIG_DIR}/redaction_rules.conf"
+
+# Runtime state for the sourced-shell contract and the DEBUG trap.
+ASH_AGENT_MODE="${ASH_AGENT_MODE:-}"
+ASH_INIT_FAILED=0
+ASH_INITIALIZED="${ASH_INITIALIZED:-}"
+ASH_DISABLED="${ASH_DISABLED:-false}"
+ASH_SESSION_ENDED=0
+ASH_SESSION_STARTED=0
+ASH_CLEANUP_DONE=0
+ASH_DEBUG_DEPTH=0
+ASH_TEMP_DIR_IS_SESSION=0
+_ASH_PREV_BASH_ENV=""
+ASH_PREV_TRAP_EXIT=""
+ASH_PREV_TRAP_DEBUG=""
+ASH_PREV_TRAP_ERR=""
+ASH_PREV_TRAP_INT=""
+ASH_PREV_TRAP_TERM=""
 
 KAFKA_ENABLED="${KAFKA_ENABLED:-false}"
 # No colon: default only when truly unset. An operator (or a validation
@@ -85,11 +145,21 @@ ASH_CURRENT_TRACE_ID=""
 ASH_LAST_COMMAND_TRACE_ID=""
 ASH_LAST_COMMAND_SPAN_ID=""
 ASH_LAST_EVENT_SPAN_ID=""
+ASH_LAST_LOGGED_COMMAND=""
+ASH_LAST_LOGGED_US=""
 
 # ─── Load Configuration ───────���──────────────────────────────────────────────
 [[ -f "${ASH_CONFIG_DIR}/ash.conf" ]] && source "${ASH_CONFIG_DIR}/ash.conf"
 
 # ─── Agent Self-Logging ──────────────────────────────────────────────────────
+_ash_note() {
+    local level="$1"
+    shift
+    local message="$*"
+    printf 'ASH %s: %s\n' "$level" "$message" >&2
+    agent_log "$level" "$message"
+}
+
 agent_log() {
     local level="$1"
     shift
@@ -108,23 +178,244 @@ agent_log() {
     else
         log_entry="{\"timestamp\":\"$timestamp\",\"level\":\"$level\",\"message\":\"$message\",\"pid\":$$}"
     fi
+    [[ -n "${ASH_AGENT_LOG:-}" ]] || return 0
     echo "$log_entry" >>"${ASH_AGENT_LOG}" 2>/dev/null || true
+}
+
+# ─── Permission Resolution ───────────────────────────────────────────────────
+# The old model required every user to write to root-owned /var/log/ash and
+# /tmp/ash. That is the root cause of issue #5. The model below is layered:
+#
+#   * root (and the `ash` service account) keeps the shared, host-wide log at
+#     /var/log/ash, which is what the systemd unit and log shipping expect;
+#   * every other user gets a private, lazily-created directory under the
+#     sticky /var/log/ash/users/<uid> (mode 0700), so one user cannot read,
+#     modify, or delete another user's local events;
+#   * if that directory is unavailable, a home-directory fallback keeps the
+#     agent running locally instead of silently disabling monitoring;
+#   * if even that fails, validation fails and the sourced-shell wrapper
+#     disables monitoring for this session without touching the caller.
+#
+# A single host-wide log writable by every user cannot be made tamper-proof:
+# group/world write permission lets any writer truncate or rewrite it. Per-user
+# directories preserve cross-user isolation at the cost of splitting the local
+# log. Kafka/PostgreSQL remains the central, cross-host record; without Kafka,
+# root must collect the per-user files (documented in docs/PERMISSIONS.md).
+
+_ash_dir_writable() {
+    [[ -d "$1" && -w "$1" && -x "$1" ]]
+}
+
+_ash_stat() {
+    # stat(1) is GNU coreutils on every supported platform (Linux only).
+    stat -c "$1" "$2" 2>/dev/null || true
+}
+
+# Create a directory that only the current user can access. If it already
+# exists, reject it when another user owns it or when it is group/world
+# writable. This matters for /var/log/ash/users: the parent is sticky but a
+# malicious user can still pre-create another uid's directory name first.
+_ash_ensure_private_dir() {
+    local dir="$1" owner mode
+    [[ -n "$dir" ]] || return 1
+
+    if [[ -e "$dir" ]]; then
+        [[ -d "$dir" ]] || return 1
+        owner=$(_ash_stat '%u' "$dir")
+        mode=$(_ash_stat '%a' "$dir")
+        if [[ -n "$owner" && "$owner" != "$EUID" && "$EUID" -ne 0 ]]; then
+            _ash_note "WARN" "Refusing $dir: owned by uid $owner, not $EUID"
+            return 1
+        fi
+        if [[ -n "$mode" ]] && (((8#$mode & 8#022) != 0)) && [[ "$EUID" -ne 0 ]]; then
+            _ash_note "WARN" "Refusing $dir: mode $mode is group/world writable"
+            return 1
+        fi
+        _ash_dir_writable "$dir" || return 1
+        return 0
+    fi
+
+    mkdir -p "$dir" 2>/dev/null || return 1
+    chmod 700 "$dir" 2>/dev/null || return 1
+    return 0
+}
+
+# Resolve one directory variable: keep the configured path when writable,
+# otherwise use the supplied per-user fallback. Never prints here; the caller
+# owns the final diagnostic so a failed fallback does not look like a hard
+# error in the middle of a successful fallback chain.
+_ash_resolve_dir() {
+    local var="$1" desired="$2" fallback="$3" strict="$4"
+    local current="${!var}"
+
+    if _ash_dir_writable "$current"; then
+        return 0
+    fi
+
+    if [[ "$strict" == "true" ]]; then
+        return 1
+    fi
+
+    if [[ -n "$fallback" ]] && _ash_ensure_private_dir "$fallback" && _ash_dir_writable "$fallback"; then
+        printf -v "$var" '%s' "$fallback"
+        _ash_note "WARN" "$var=$current is not writable; using $fallback"
+        return 0
+    fi
+
+    return 1
+}
+
+_ash_home_state_root() {
+    [[ -n "${HOME:-}" ]] || return 1
+    printf '%s/ash' "${XDG_STATE_HOME:-${HOME}/.local/state}"
+}
+
+ash_resolve_temp_dir() {
+    local candidate="${ASH_TEMP_DIR:-}" fallback
+
+    if [[ -n "$candidate" ]] && _ash_dir_writable "$candidate"; then
+        ASH_TEMP_DIR_IS_SESSION=0
+        return 0
+    fi
+
+    if [[ -n "$candidate" ]]; then
+        _ash_note "WARN" "ASH_TEMP_DIR=$candidate is not writable; using a per-session directory"
+    fi
+
+    fallback=$(mktemp -d "${TMPDIR:-/tmp}/ash.${EUID}.XXXXXXXX" 2>/dev/null) || {
+        printf 'ERROR: cannot create a writable session temp directory\n' >&2
+        return 1
+    }
+    if ! chmod 700 "$fallback" 2>/dev/null; then
+        rm -rf "$fallback" 2>/dev/null || true
+        printf 'ERROR: cannot secure session temp directory %s\n' "$fallback" >&2
+        return 1
+    fi
+
+    ASH_TEMP_DIR="$fallback"
+    ASH_TEMP_DIR_IS_SESSION=1
+    return 0
+}
+
+ash_resolve_log_dir() {
+    local fallback="${ASH_USER_LOG_ROOT}/${EUID}" home_root
+
+    if _ash_resolve_dir ASH_LOG_DIR "$ASH_LOG_DIR" "$fallback" "$ASH_STRICT_PERMISSIONS"; then
+        return 0
+    fi
+
+    if [[ "$ASH_STRICT_PERMISSIONS" != "true" && "$ASH_ALLOW_HOME_FALLBACK" == "true" ]]; then
+        home_root=$(_ash_home_state_root) || return 1
+        fallback="${home_root}/log"
+        if _ash_ensure_private_dir "$fallback" && _ash_dir_writable "$fallback"; then
+            ASH_LOG_DIR="$fallback"
+            _ash_note "WARN" "ASH_LOG_DIR is using the home-directory fallback $ASH_LOG_DIR"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+ash_resolve_spool_dir() {
+    local fallback="${ASH_USER_SPOOL_ROOT}/${EUID}" home_root
+
+    if _ash_resolve_dir ASH_SPOOL_DIR "$ASH_SPOOL_DIR" "$fallback" "$ASH_STRICT_PERMISSIONS"; then
+        return 0
+    fi
+
+    if [[ "$ASH_STRICT_PERMISSIONS" != "true" && "$ASH_ALLOW_HOME_FALLBACK" == "true" ]]; then
+        home_root=$(_ash_home_state_root) || return 1
+        fallback="${home_root}/spool"
+        if _ash_ensure_private_dir "$fallback" && _ash_dir_writable "$fallback"; then
+            ASH_SPOOL_DIR="$fallback"
+            _ash_note "WARN" "ASH_SPOOL_DIR is using the home-directory fallback $ASH_SPOOL_DIR"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+ash_resolve_paths() {
+    [[ -n "${ASH_EVENTS_FILE:-}" ]] || ASH_EVENTS_FILE="${ASH_LOG_DIR}/events.jsonl"
+    [[ -n "${ASH_HASH_FILE:-}" ]] || ASH_HASH_FILE="${ASH_LOG_DIR}/.hash_chain"
+    [[ -n "${ASH_AGENT_LOG:-}" ]] || ASH_AGENT_LOG="${ASH_LOG_DIR}/agent.log"
+    [[ -n "${ASH_STATE_FILE:-}" ]] || ASH_STATE_FILE="${ASH_LOG_DIR}/agent_state.json"
+}
+
+# Pre-create the append targets with the narrowest mode that still lets the
+# intended reader in. Without this, the first writer's umask decides whether
+# events.jsonl is world-readable, and a later writer inherits that mode.
+ash_prepare_log_files() {
+    local file old_umask mode
+
+    old_umask=$(umask)
+    if [[ "$EUID" -eq 0 ]]; then
+        umask 027
+    else
+        umask 077
+    fi
+
+    for file in "$ASH_EVENTS_FILE" "$ASH_AGENT_LOG"; do
+        if [[ ! -e "$file" ]]; then
+            : >"$file" 2>/dev/null || {
+                umask "$old_umask"
+                return 1
+            }
+        fi
+        if [[ "$(stat -c '%u' "$file" 2>/dev/null || echo '')" == "$EUID" ]]; then
+            mode=$(_ash_stat '%a' "$file")
+            if [[ -n "$mode" ]] && (((8#$mode & 8#022) != 0)); then
+                if [[ "$EUID" -eq 0 && "$ASH_LOG_DIR" == "/var/log/ash" ]]; then
+                    chmod 640 "$file" 2>/dev/null || true
+                else
+                    chmod 600 "$file" 2>/dev/null || true
+                fi
+            fi
+        fi
+    done
+
+    umask "$old_umask"
+    return 0
 }
 
 # ─── Configuration Validation ────────────────────────────────────────────────
 validate_config() {
     local errors=0
 
-    for dir_var in ASH_LOG_DIR ASH_TEMP_DIR ASH_SPOOL_DIR; do
-        local dir_path="${!dir_var}"
-        if [[ ! -d "$dir_path" ]]; then
-            mkdir -p "$dir_path" 2>/dev/null || {
-                echo "ERROR: Cannot create $dir_var=$dir_path" >&2
-                errors=$((errors + 1))
-            }
-        fi
-        if [[ ! -w "$dir_path" ]]; then
-            echo "ERROR: $dir_var=$dir_path is not writable" >&2
+    if ! ash_resolve_temp_dir; then
+        errors=$((errors + 1))
+    fi
+
+    if ! ash_resolve_log_dir; then
+        echo "ERROR: ASH_LOG_DIR=$ASH_LOG_DIR is not writable and no per-user or home fallback is available" >&2
+        errors=$((errors + 1))
+    fi
+
+    if ! ash_resolve_spool_dir; then
+        echo "ERROR: ASH_SPOOL_DIR=$ASH_SPOOL_DIR is not writable and no per-user or home fallback is available" >&2
+        errors=$((errors + 1))
+    fi
+
+    ash_resolve_paths
+
+    if [[ "${ASH_LOG_DIR}" == *'*'* || "${ASH_TEMP_DIR}" == *'*'* || "${ASH_SPOOL_DIR}" == *'*'* ]]; then
+        echo "ERROR: ASH directories must not contain shell glob characters" >&2
+        errors=$((errors + 1))
+    fi
+
+    if [[ -L "${ASH_LOG_DIR}" || -L "${ASH_SPOOL_DIR}" ]]; then
+        echo "ERROR: ASH_LOG_DIR and ASH_SPOOL_DIR must not be symlinks" >&2
+        errors=$((errors + 1))
+    fi
+
+    # These are required for the hash chain and for serialising concurrent
+    # writers. Missing tools used to fail silently inside a subshell.
+    local required_cmd
+    for required_cmd in flock sha256sum; do
+        if ! command -v "$required_cmd" >/dev/null 2>&1; then
+            echo "ERROR: required command not found: $required_cmd" >&2
             errors=$((errors + 1))
         fi
     done
@@ -137,6 +428,9 @@ validate_config() {
         if [[ -z "${KAFKA_TOPIC:-}" ]]; then
             echo "ERROR: KAFKA_ENABLED=true but KAFKA_TOPIC is empty" >&2
             errors=$((errors + 1))
+        fi
+        if ! command -v kafka-console-producer.sh >/dev/null 2>&1; then
+            _ash_note "WARN" "kafka-console-producer.sh not found; events will stay in the local spool"
         fi
     fi
 
@@ -186,6 +480,9 @@ safe_log_write() {
     local temp_file="${ASH_TEMP_DIR}/write.${BASHPID:-$$}.tmp"
 
     printf '%s\n' "$content" >"$temp_file" 2>/dev/null || return 1
+    # The temp file lives in a 0700 directory, but an explicit ASH_TEMP_DIR
+    # may be shared. Never leave an event readable by another local user.
+    chmod 600 "$temp_file" 2>/dev/null || true
 
     (
         flock -x 200
@@ -306,15 +603,19 @@ redact_sensitive_data() {
 
 # ─── Hash-Chained Append-Only Logs ─────────────────────────────��────────────
 hash_chain_init() {
+    local hash_dir
+    hash_dir=$(dirname "${ASH_HASH_FILE}")
+    mkdir -p "$hash_dir" 2>/dev/null || return 1
+
     if [[ ! -f "${ASH_HASH_FILE}" ]]; then
         (
             # Two sessions can start at the same time on a host that has
             # never run ASH. Without the lock both can see the missing file
             # and one can truncate the genesis value the other just wrote.
-            exec {lock_fd}>"${ASH_HASH_FILE}.lock"
-            flock -x "$lock_fd"
+            exec {lock_fd}>"${ASH_HASH_FILE}.lock" || exit 1
+            flock -x "$lock_fd" || exit 1
             if [[ ! -f "${ASH_HASH_FILE}" ]]; then
-                echo "0000000000000000000000000000000000000000000000000000000000000000" >"${ASH_HASH_FILE}"
+                printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" >"${ASH_HASH_FILE}" || exit 1
                 # 600, not 400: hash_chain_append() must keep appending to this
                 # file for the life of the process. 400 (no write bit, even for
                 # the owner) blocks that on every non-root run and only ever
@@ -324,7 +625,9 @@ hash_chain_init() {
                 chmod 600 "${ASH_HASH_FILE}" 2>/dev/null || true
             fi
         )
+        return $?
     fi
+    return 0
 }
 
 # Read the last hash, sign the event, and append the new hash to the chain
@@ -341,7 +644,11 @@ _hash_chain_append_unlocked() {
     # "previous hash" is whatever is actually on disk right now. Caching it
     # in memory would silently break chain integrity the moment a second
     # terminal session appends an event first.
-    prev_hash=$(tail -1 "${ASH_HASH_FILE}" 2>/dev/null || echo "0000000000000000000000000000000000000000000000000000000000000000")
+    prev_hash=$(tail -1 "${ASH_HASH_FILE}" 2>/dev/null || echo "")
+    # An empty or missing chain file must behave like the genesis value; an
+    # empty prev_hash would sign an event that verify_hash_chain() can never
+    # validate.
+    [[ -n "$prev_hash" ]] || prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
     local combined="${prev_hash}${event_json}"
     local current_hash
     # sha256sum's own output ("<hash>  -") already has the hash first;
@@ -368,8 +675,8 @@ hash_chain_append() {
         # both read the same prev_hash before either appends, producing two
         # events that fork the chain. Serialize the read/compute/append
         # sequence across every process sharing this host's chain.
-        exec {lock_fd}>"${ASH_HASH_FILE}.lock"
-        flock -x "$lock_fd"
+        exec {lock_fd}>"${ASH_HASH_FILE}.lock" || exit 1
+        flock -x "$lock_fd" || exit 1
         _hash_chain_append_unlocked "$1"
     )
 }
@@ -428,8 +735,10 @@ verify_hash_chain() {
 
 # ─── Local Spool Queue ───────────────────────────────────────────────────────
 spool_init() {
-    mkdir -p "${ASH_SPOOL_DIR}/pending" "${ASH_SPOOL_DIR}/sent"
-    chmod 700 "${ASH_SPOOL_DIR}"
+    mkdir -p "${ASH_SPOOL_DIR}/pending" "${ASH_SPOOL_DIR}/sent" 2>/dev/null || return 1
+    chmod 700 "${ASH_SPOOL_DIR}" 2>/dev/null || return 1
+    chmod 700 "${ASH_SPOOL_DIR}/pending" "${ASH_SPOOL_DIR}/sent" 2>/dev/null || return 1
+    return 0
 }
 
 spool_write() {
@@ -438,6 +747,7 @@ spool_write() {
     # in the same nanosecond would otherwise overwrite each other's spool file.
     local spool_file="${ASH_SPOOL_DIR}/pending/$(date +%s%N)_${BASHPID:-$$}"
     printf '%s\n' "$event_json" >"$spool_file" 2>/dev/null || return 1
+    chmod 600 "$spool_file" 2>/dev/null || true
 
     # Enforce max spool size
     local spool_size
@@ -459,9 +769,9 @@ spool_flush() {
 
         if send_to_kafka_raw "$event_data"; then
             mv "$spool_file" "${ASH_SPOOL_DIR}/sent/" 2>/dev/null || rm -f "$spool_file"
-            ((sent++))
+            sent=$((sent + 1))
         else
-            ((failed++))
+            failed=$((failed + 1))
             break
         fi
     done
@@ -472,10 +782,12 @@ spool_flush() {
 }
 
 spool_flush_timer() {
-    while true; do
-        sleep 30
-        spool_flush 2>/dev/null || true
-    done &
+    {
+        while true; do
+            sleep 30
+            spool_flush 2>/dev/null || true
+        done
+    } >/dev/null 2>&1 &
     echo $! >"${ASH_TEMP_DIR}/spool_flush.pid"
 }
 
@@ -485,6 +797,11 @@ send_to_kafka_raw() {
     local retry=0
     local -a producer=(kafka-console-producer.sh)
     local send_timeout="${KAFKA_SEND_TIMEOUT:-10}"
+
+    # Fail immediately instead of retrying with backoff for ~12 seconds when
+    # the producer is not installed. A non-root user is unlikely to have the
+    # Kafka CLI on PATH; keeping events queued is the correct outcome.
+    command -v kafka-console-producer.sh >/dev/null 2>&1 || return 1
 
     # A producer that connects but never returns (broker accepts the TCP
     # connection and then stops responding) would otherwise block spool_flush
@@ -502,7 +819,7 @@ send_to_kafka_raw() {
             2>/dev/null; then
             return 0
         fi
-        ((retry++))
+        retry=$((retry + 1))
         sleep $((retry * 2))
     done
     return 1
@@ -636,23 +953,45 @@ emit_event() {
     # file consistent, but releases it before safe_log_write() runs, so two
     # sessions can append their hashes in one order and their events in the
     # other, breaking verify_hash_chain() even though every hash is correct.
+    #
+    # This function is called from the DEBUG trap. It must never return a
+    # non-zero status to the caller: under the caller's `set -e` that would
+    # abort the user's command, and in the trap handler it can abort the
+    # shell itself.
     local signed_event lock_fd
-    exec {lock_fd}>"${ASH_HASH_FILE}.lock"
-    flock -x "$lock_fd"
-    signed_event=$(_hash_chain_append_unlocked "$event")
-    safe_log_write "$signed_event"
-    flock -u "$lock_fd"
+    if ! exec {lock_fd}>"${ASH_HASH_FILE}.lock" 2>/dev/null; then
+        _ash_note "ERROR" "Cannot open hash-chain lock ${ASH_HASH_FILE}.lock"
+        return 0
+    fi
+    if ! flock -x "$lock_fd" 2>/dev/null; then
+        _ash_note "ERROR" "Cannot lock ${ASH_HASH_FILE}.lock"
+        exec {lock_fd}>&-
+        return 0
+    fi
+
+    signed_event=$(_hash_chain_append_unlocked "$event") || signed_event=""
+    if [[ -n "$signed_event" ]]; then
+        if ! safe_log_write "$signed_event"; then
+            _ash_note "ERROR" "Failed to append event to ${ASH_EVENTS_FILE}"
+        fi
+    fi
+
+    flock -u "$lock_fd" 2>/dev/null || true
     exec {lock_fd}>&-
 
-    # Forward to Kafka spool
-    if [[ "${KAFKA_ENABLED}" == "true" ]]; then
-        spool_write "$signed_event"
+    # Forward to Kafka spool. A failed spool write must not lose the local
+    # event or abort the caller; the next flush retries whatever is queued.
+    if [[ "${KAFKA_ENABLED}" == "true" && -n "$signed_event" ]]; then
+        if ! spool_write "$signed_event"; then
+            _ash_note "ERROR" "Failed to write Kafka spool event to ${ASH_SPOOL_DIR}"
+        fi
     fi
 
     # Assignment, not `((EVENTS_LOGGED++))`: post-increment evaluates to the
     # old value, so the first event made this function return status 1 --
     # and under `set -e` it aborted the caller after a successful write.
     EVENTS_LOGGED=$((EVENTS_LOGGED + 1))
+    return 0
 }
 
 # ─── Session Events ���─────────────────────────���──────────────────────────────
@@ -683,7 +1022,10 @@ emit_session_end() {
         extra="{\"session_start\":\"$ASH_SESSION_START\",\"duration_seconds\":$duration,\"events_in_session\":$EVENTS_LOGGED}"
     fi
     emit_event "session_end" "$extra"
-    spool_flush 2>/dev/null || true
+    # Do not flush the Kafka spool synchronously here. send_to_kafka_raw()
+    # retries with backoff, so a broker outage would otherwise make closing
+    # a terminal take tens of seconds. The pending spool survives the session
+    # and is flushed by the next agent start (recover_state) or timer.
 }
 
 # ─── Rate Limiting ────────────��──────────────────────────────────────────────
@@ -692,7 +1034,7 @@ rate_limit_check() {
     current_second=$(date +%s)
 
     if [[ $current_second -eq $LAST_SECOND ]]; then
-        ((COMMAND_COUNTER++))
+        COMMAND_COUNTER=$((COMMAND_COUNTER + 1))
         if [[ $COMMAND_COUNTER -gt $MAX_COMMANDS_PER_SECOND ]]; then
             return 1
         fi
@@ -750,7 +1092,7 @@ track_file_changes() {
             continue
         fi
 
-        local snapshot="${ASH_TEMP_DIR}/pre_$(basename "${file_path}").$$_$(date +%s%N)"
+        local snapshot="${ASH_TEMP_DIR}/pre_$(basename "${file_path}").${BASHPID:-$$}_$(date +%s%N)"
         cp --no-dereference "${file_path}" "${snapshot}" 2>/dev/null || continue
 
         # Compare after command (deferred via PROMPT_COMMAND)
@@ -826,9 +1168,16 @@ emit_file_event() {
 ASH_PENDING_SNAPSHOTS=()
 
 # ─── Main Command Logging ────��───────────────────────────────────────────────
-log_command() {
-    # Skip ASH's own internal commands
-    [[ "${BASH_COMMAND}" =~ ^(log_command|safe_log_write|emit_event|hash_chain|spool_|agent_log|rate_limit|redact_|check_pending|track_file) ]] && return 0
+# The DEBUG trap handler and the body are deliberately separate. The handler
+# sets ASH_DEBUG_DEPTH before calling the body so the external commands the
+# body runs (`date`, `jq`, `sha256sum`, `flock`, `sed`, ...) cannot re-enter
+# through the same DEBUG trap. The old prefix-only guard could not cover
+# those commands, which is why sourcing the agent hung (issue #6).
+_log_command_impl() {
+    # Skip ASH's own internal commands. The depth guard already prevents
+    # recursion; this is a cheap early-out for the prompt hook and the
+    # handler itself, whose names are known.
+    [[ "${BASH_COMMAND}" =~ ^(_log_command_impl|log_command|_ash_debug_trap|ash_prompt_command|safe_log_write|emit_event|hash_chain|spool_|agent_log|rate_limit|redact_|check_pending|track_file|return)([[:space:]]|$) ]] && return 0
     [[ "${BASH_COMMAND}" == ":" ]] && return 0
 
     # Rate limiting
@@ -839,11 +1188,26 @@ log_command() {
         return 0
     fi
 
+    # The EXIT trap's first command fires the DEBUG trap with the last
+    # command's stale BASH_COMMAND, which used to produce a duplicate event
+    # for the final command of every session. Suppress only an identical
+    # command within a very short window; legitimate repeated commands are
+    # normally separated by more than this.
+    local now_us
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        now_us="${EPOCHREALTIME/./}"
+    else
+        now_us=$(($(date +%s%N) / 1000))
+    fi
+    if [[ -n "${ASH_LAST_LOGGED_US:-}" && "${BASH_COMMAND}" == "${ASH_LAST_LOGGED_COMMAND:-}" ]] &&
+        ((now_us - ASH_LAST_LOGGED_US < 250000)); then
+        return 0
+    fi
+    ASH_LAST_LOGGED_COMMAND="${BASH_COMMAND}"
+    ASH_LAST_LOGGED_US="$now_us"
+
     local cmd
     cmd=$(redact_sensitive_data "${BASH_COMMAND}")
-
-    local start_time
-    start_time=$(date +%s%N 2>/dev/null || echo "0")
 
     # Track potential file changes
     track_file_changes "${BASH_COMMAND}"
@@ -852,16 +1216,20 @@ log_command() {
     # privilege/file events and a failing command_end are children.
     ASH_CURRENT_TRACE_ID=$(new_trace_id)
 
-    # Build extra fields
+    # Build extra fields. Capture BASH_SUBSHELL and BASH_LINENO before the
+    # command substitution: inside $(jq ...) they report the substitution's
+    # own values, which made every event claim bash_subshell: 1.
+    local bash_subshell="${BASH_SUBSHELL:-0}"
+    local lineno="${BASH_LINENO[0]:-0}"
     local extra
     if command -v jq >/dev/null 2>&1; then
         extra=$(jq -n -c \
             --arg cmd "$cmd" \
-            --argjson sub "${BASH_SUBSHELL:-0}" \
-            --argjson lineno "${BASH_LINENO[0]:-0}" \
+            --argjson sub "$bash_subshell" \
+            --argjson lineno "$lineno" \
             '{command: $cmd, bash_subshell: $sub, lineno: $lineno}')
     else
-        extra="{\"command\":\"$cmd\",\"bash_subshell\":${BASH_SUBSHELL:-0},\"lineno\":${BASH_LINENO[0]:-0}}"
+        extra="{\"command\":\"$cmd\",\"bash_subshell\":$bash_subshell,\"lineno\":$lineno}"
     fi
 
     emit_event "command_start" "$extra"
@@ -886,10 +1254,34 @@ log_command() {
     # audit or container events). Prompt-time file events re-select it from
     # ASH_LAST_COMMAND_TRACE_ID before emitting.
     ASH_CURRENT_TRACE_ID=""
+    return 0
+}
+
+log_command() {
+    if ((ASH_DEBUG_DEPTH > 0)); then return 0; fi
+    ASH_DEBUG_DEPTH=1
+    _log_command_impl || true
+    return $((ASH_DEBUG_DEPTH = 0))
+}
+
+_ash_debug_trap() {
+    if ((ASH_DEBUG_DEPTH > 0)); then return 0; fi
+    ASH_DEBUG_DEPTH=1
+    _log_command_impl || true
+    # Run any pre-existing DEBUG trap the caller had. Keep the depth guard
+    # active so the previous handler's own commands cannot re-enter ASH.
+    _ash_run_prev_trap DEBUG || true
+    return $((ASH_DEBUG_DEPTH = 0))
 }
 
 # ─── PROMPT_COMMAND Integration ──────────────────────────────────────────────
 ash_prompt_command() {
+    # The DEBUG trap fires for the prompt hook itself; the handler skips it by
+    # name. Guard the hook's internal commands too so they are not logged as
+    # user commands.
+    if ((ASH_DEBUG_DEPTH > 0)); then return 0; fi
+    ASH_DEBUG_DEPTH=1
+
     local last_exit=$?
 
     # Check for file changes from last command
@@ -921,6 +1313,7 @@ ash_prompt_command() {
     # The command trace ends here; a session end or another root event must
     # start a new trace instead of attaching to the last command.
     ASH_CURRENT_TRACE_ID=""
+    return $((ASH_DEBUG_DEPTH = 0))
 }
 
 # ─── inotify Background Watcher ─────────────────────────────────────────────
@@ -948,7 +1341,7 @@ start_file_watcher() {
                 extra="{\"file_path\":\"$file\",\"inotify_event\":\"$event\",\"source\":\"inotify\"}"
             fi
             emit_event "file_${event,,}" "$extra"
-        done &
+        done >/dev/null 2>&1 &
 
     echo $! >"${ASH_TEMP_DIR}/inotify.pid"
     agent_log "INFO" "inotify watcher started (PID: $(cat "${ASH_TEMP_DIR}/inotify.pid"))"
@@ -974,7 +1367,7 @@ start_container_monitor() {
             extra="{\"source\":\"docker-events\",\"container_id\":\"$container_id\",\"container_name\":\"$name\",\"container_image\":\"$image\",\"docker_action\":\"$action\"}"
         fi
         emit_event "container_${action}" "$extra"
-    done &
+    done >/dev/null 2>&1 &
 
     echo $! >"${ASH_TEMP_DIR}/docker_events.pid"
     agent_log "INFO" "Docker event monitor started"
@@ -1022,7 +1415,7 @@ start_auditd_monitor() {
             fi
             emit_event "$event_type" "$extra"
         fi
-    done &
+    done >/dev/null 2>&1 &
 
     echo $! >"${ASH_TEMP_DIR}/auditd_tail.pid"
     agent_log "INFO" "auditd monitor started"
@@ -1030,7 +1423,8 @@ start_auditd_monitor() {
 
 # ─── Crash Recovery ──��───────────────────────────────────────────────────────
 save_state() {
-    local state_json
+    local state_json tmp_file
+
     if command -v jq >/dev/null 2>&1; then
         state_json=$(jq -n -c \
             --argjson pid "$$" \
@@ -1038,44 +1432,73 @@ save_state() {
             --arg sid "${ASH_SESSION_ID:-unknown}" \
             --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --argjson events "${EVENTS_LOGGED:-0}" \
-            '{pid: $pid, ppid: $ppid, session_id: $sid, started_at: $started, events_logged: $events}')
+            --arg temp "${ASH_TEMP_DIR}" \
+            --arg log "${ASH_LOG_DIR}" \
+            --arg mode "${ASH_AGENT_MODE:-unknown}" \
+            '{pid: $pid, ppid: $ppid, session_id: $sid, started_at: $started, events_logged: $events, temp_dir: $temp, log_dir: $log, mode: $mode}')
     else
-        state_json="{\"pid\":$$,\"ppid\":${PPID:-1},\"session_id\":\"${ASH_SESSION_ID}\",\"events_logged\":${EVENTS_LOGGED:-0}}"
+        state_json="{\"pid\":$$,\"ppid\":${PPID:-1},\"session_id\":\"${ASH_SESSION_ID}\",\"events_logged\":${EVENTS_LOGGED:-0},\"temp_dir\":\"${ASH_TEMP_DIR}\",\"log_dir\":\"${ASH_LOG_DIR}\",\"mode\":\"${ASH_AGENT_MODE:-unknown}\"}"
     fi
-    echo "$state_json" >"${ASH_STATE_FILE}" 2>/dev/null || true
+
+    # Write-then-rename: a concurrent reader must never see a half-written
+    # state file, and a crash during the write must not leave a truncated one.
+    tmp_file="${ASH_STATE_FILE}.tmp.${BASHPID:-$$}"
+    if printf '%s\n' "$state_json" >"$tmp_file" 2>/dev/null; then
+        chmod 600 "$tmp_file" 2>/dev/null || true
+        mv -f "$tmp_file" "${ASH_STATE_FILE}" 2>/dev/null || rm -f "$tmp_file" 2>/dev/null || true
+    fi
+    return 0
 }
 
 recover_state() {
-    [[ ! -f "${ASH_STATE_FILE}" ]] && return 0
+    # A missing state file is normal on first run. Flush anything a previous
+    # session left in the spool and return; this function must not disable a
+    # new session.
+    if [[ ! -f "${ASH_STATE_FILE}" ]]; then
+        spool_flush 2>/dev/null || true
+        return 0
+    fi
 
-    local prev_pid
+    local prev_pid prev_temp prev_session
     if command -v jq >/dev/null 2>&1; then
-        prev_pid=$(jq -r '.pid' "${ASH_STATE_FILE}" 2>/dev/null || echo "")
+        prev_pid=$(jq -r '.pid // empty' "${ASH_STATE_FILE}" 2>/dev/null || echo "")
+        prev_temp=$(jq -r '.temp_dir // empty' "${ASH_STATE_FILE}" 2>/dev/null || echo "")
+        prev_session=$(jq -r '.session_id // empty' "${ASH_STATE_FILE}" 2>/dev/null || echo "")
     else
         prev_pid=$(grep -oP '"pid":\K\d+' "${ASH_STATE_FILE}" 2>/dev/null || echo "")
+        prev_temp=$(grep -oP '"temp_dir":"\K[^"]*' "${ASH_STATE_FILE}" 2>/dev/null || echo "")
+        prev_session=$(grep -oP '"session_id":"\K[^"]*' "${ASH_STATE_FILE}" 2>/dev/null || echo "")
     fi
 
-    # Check if previous instance is still running
-    if [[ -n "$prev_pid" ]] && kill -0 "$prev_pid" 2>/dev/null; then
-        agent_log "ERROR" "Previous ASH agent (PID $prev_pid) still running"
-        return 1
+    # Concurrent terminals are normal. The old code treated any live PID in
+    # the shared state file as a reason to disable the *new* session, which
+    # meant opening a second terminal silently turned monitoring off. Only
+    # reap watchers when the previous shell is actually gone.
+    if [[ -n "$prev_pid" && "$prev_pid" != "$$" ]] && kill -0 "$prev_pid" 2>/dev/null; then
+        agent_log "INFO" "Concurrent ASH session detected (PID $prev_pid); keeping both"
+        spool_flush 2>/dev/null || true
+        return 0
     fi
 
-    agent_log "INFO" "Recovering from previous state (prev PID: $prev_pid)"
+    if [[ -n "$prev_temp" && "$prev_temp" != "${ASH_TEMP_DIR}" && -d "$prev_temp" ]]; then
+        agent_log "INFO" "Reaping watchers from previous session (PID: ${prev_pid:-unknown}, session: ${prev_session:-unknown})"
+        for pid_file in "${prev_temp}"/*.pid; do
+            [[ -f "$pid_file" ]] || continue
+            local orphan_pid
+            orphan_pid=$(cat "$pid_file" 2>/dev/null || true)
+            [[ -n "$orphan_pid" ]] && kill "$orphan_pid" 2>/dev/null || true
+            rm -f "$pid_file" 2>/dev/null || true
+        done
+        # Only remove the directory if it is one of ours (mktemp template) or
+        # the legacy /tmp/ash; never recursively delete an operator-supplied
+        # ASH_TEMP_DIR.
+        case "$prev_temp" in
+            "${TMPDIR:-/tmp}"/ash.* | /tmp/ash) rm -rf "$prev_temp" 2>/dev/null || true ;;
+        esac
+    fi
 
-    # Kill orphaned background processes
-    for pid_file in "${ASH_TEMP_DIR}"/*.pid; do
-        [[ -f "$pid_file" ]] || continue
-        local orphan_pid
-        orphan_pid=$(cat "$pid_file")
-        kill "$orphan_pid" 2>/dev/null || true
-        rm -f "$pid_file"
-    done
-
-    # Flush pending spool
     spool_flush 2>/dev/null || true
-
-    rm -f "${ASH_STATE_FILE}"
+    return 0
 }
 
 # ─── systemd Watchdog ───────────────────────────────────────────────────────
@@ -1089,6 +1512,7 @@ watchdog_kick() {
 
 start_watchdog() {
     [[ -z "${NOTIFY_SOCKET:-}" ]] && return 0
+    command -v systemd-notify >/dev/null 2>&1 || return 0
     # Type=notify waits for this; NotifyAccess=all in the unit allows the
     # helper process to send it.
     systemd-notify --ready 2>/dev/null || true
@@ -1097,79 +1521,275 @@ start_watchdog() {
             watchdog_kick
             sleep "${ASH_WATCHDOG_INTERVAL}"
         done
-    ) &
-    echo "$!" >"${ASH_TEMP_DIR}/watchdog.pid"
+    ) >/dev/null 2>&1 &
+    echo "$!" >"${ASH_TEMP_DIR}/watchdog.pid" 2>/dev/null || true
 }
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
 cleanup_ash() {
-    emit_session_end 2>/dev/null || true
+    if ((ASH_CLEANUP_DONE > 0)); then return 0; fi
+    ASH_CLEANUP_DONE=1
 
-    # Kill background processes
+    # Remove the DEBUG trap before doing any work. Cleanup runs from the
+    # EXIT/INT/TERM traps, and every command it executes would otherwise
+    # re-enter the DEBUG handler, recursively emitting events while the
+    # shell is trying to exit.
+    ASH_DEBUG_DEPTH=1
+    trap - DEBUG 2>/dev/null || true
+
+    if [[ "${ASH_SESSION_STARTED:-0}" -eq 1 && "${ASH_SESSION_ENDED:-0}" -eq 0 ]]; then
+        ASH_SESSION_ENDED=1
+        emit_session_end 2>/dev/null || true
+    fi
+
+    # Kill background processes started by this session.
     for pid_file in "${ASH_TEMP_DIR}"/*.pid; do
         [[ -f "$pid_file" ]] || continue
-        kill "$(cat "$pid_file")" 2>/dev/null || true
+        kill "$(cat "$pid_file" 2>/dev/null || true)" 2>/dev/null || true
+        rm -f "$pid_file" 2>/dev/null || true
     done
 
-    rm -rf "${ASH_TEMP_DIR}"/* 2>/dev/null || true
+    # Only remove a directory this process created. ASH_TEMP_DIR may be an
+    # operator-supplied shared path; deleting its contents would destroy
+    # unrelated files.
+    if [[ "${ASH_TEMP_DIR_IS_SESSION:-0}" -eq 1 && -n "${ASH_TEMP_DIR:-}" ]]; then
+        rm -rf "$ASH_TEMP_DIR" 2>/dev/null || true
+    fi
+
     agent_log "INFO" "ASH agent stopped"
+    return 0
 }
 
-# ─── Signal Handlers ─────────────────────────────────────────────────────────
-trap cleanup_ash EXIT
-trap 'agent_log "WARN" "Received SIGTERM"; cleanup_ash; exit 0' SIGTERM
-trap 'agent_log "WARN" "Received SIGINT"; cleanup_ash; exit 0' SIGINT
-trap 'agent_log "ERROR" "Command failed at line $LINENO: $BASH_COMMAND"' ERR
+# ─── Trap Management ─────────────────────────────────────────────────────────
+# Extract the command portion of `trap -p SIG` without re-installing it.
+_ash_prev_trap_cmd() {
+    local sig="$1" line
+    line=$(trap -p "$sig" 2>/dev/null) || return 1
+    [[ -n "$line" ]] || return 1
+    line="${line#trap -- }"
+    line="${line% "$sig"}"
+    eval "printf '%s' $line"
+}
+
+_ash_run_prev_trap() {
+    local sig="$1" cmd=""
+
+    # Use the trap captured before ASH installed its own handlers. Calling
+    # `trap -p SIG` here would return ASH's current handler, which would then
+    # call itself recursively (the EXIT handler re-entering on exit, the DEBUG
+    # handler re-entering on every command).
+    case "$sig" in
+        EXIT) cmd="${_ASH_PREV_TRAP_EXIT:-}" ;;
+        DEBUG) cmd="${_ASH_PREV_TRAP_DEBUG:-}" ;;
+        ERR) cmd="${_ASH_PREV_TRAP_ERR:-}" ;;
+        INT) cmd="${_ASH_PREV_TRAP_INT:-}" ;;
+        TERM) cmd="${_ASH_PREV_TRAP_TERM:-}" ;;
+    esac
+
+    [[ -n "$cmd" ]] || return 0
+    eval "$cmd"
+}
+
+ash_capture_caller_state() {
+    _ASH_PREV_TRAP_EXIT=$(_ash_prev_trap_cmd EXIT) || true
+    _ASH_PREV_TRAP_DEBUG=$(_ash_prev_trap_cmd DEBUG) || true
+    _ASH_PREV_TRAP_ERR=$(_ash_prev_trap_cmd ERR) || true
+    _ASH_PREV_TRAP_INT=$(_ash_prev_trap_cmd INT) || true
+    _ASH_PREV_TRAP_TERM=$(_ash_prev_trap_cmd TERM) || true
+    _ASH_PREV_BASH_ENV="${BASH_ENV:-}"
+}
+
+_ash_restore_previous_traps() {
+    if [[ -n "$_ASH_PREV_TRAP_EXIT" ]]; then trap "$_ASH_PREV_TRAP_EXIT" EXIT; else trap - EXIT; fi
+    if [[ -n "$_ASH_PREV_TRAP_DEBUG" ]]; then trap "$_ASH_PREV_TRAP_DEBUG" DEBUG; else trap - DEBUG; fi
+    if [[ -n "$_ASH_PREV_TRAP_ERR" ]]; then trap "$_ASH_PREV_TRAP_ERR" ERR; else trap - ERR; fi
+    if [[ -n "$_ASH_PREV_TRAP_INT" ]]; then trap "$_ASH_PREV_TRAP_INT" INT; else trap - INT; fi
+    if [[ -n "$_ASH_PREV_TRAP_TERM" ]]; then trap "$_ASH_PREV_TRAP_TERM" TERM; else trap - TERM; fi
+}
+
+ash_restore_caller_options() {
+    if ((_ASH_CALLER_ERREXIT)); then set -e; else set +e; fi
+    if ((_ASH_CALLER_NOUNSET)); then set -u; else set +u; fi
+    if ((_ASH_CALLER_PIPEFAIL)); then set -o pipefail; else set +o pipefail; fi
+    if ((_ASH_CALLER_XTRACE)); then set -x; else set +x; fi
+    if ((_ASH_CALLER_NOGLOB)); then set -f; else set +f; fi
+    if ((_ASH_CALLER_ALLEXPORT)); then set -a; else set +a; fi
+    if ((_ASH_CALLER_FUNCTRACE)); then set -T; else set +T; fi
+    if ((_ASH_CALLER_ERRTRACE)); then set -E; else set +E; fi
+}
+
+ash_install_traps() {
+    local mode="$1"
+
+    trap '_ash_exit_trap' EXIT
+
+    if [[ "$mode" == "sourced" ]]; then
+        # functrace (`set -T`) is deliberately NOT enabled for sourced mode.
+        # With it, every command inside the handler, every command substitution
+        # and every background subshell re-enters the trap; that is issue #6.
+        # Top-level user commands are still captured, which is what an
+        # interactive shell actually needs. Full function/subshell coverage is
+        # the job of the auditd layer, not the DEBUG trap.
+        trap '_ash_debug_trap' DEBUG
+    fi
+
+    if [[ "$mode" == "direct" ]]; then
+        trap '_ash_err_trap' ERR
+        trap '_ash_int_trap' INT
+        trap '_ash_term_trap' TERM
+    fi
+}
+
+_ash_exit_trap() {
+    ASH_DEBUG_DEPTH=1
+    trap - DEBUG 2>/dev/null || true
+    cleanup_ash 2>/dev/null || true
+    _ash_run_prev_trap EXIT || true
+}
+
+_ash_err_trap() {
+    agent_log "ERROR" "Command failed at line ${LINENO:-?}: ${BASH_COMMAND:-unknown}"
+}
+
+_ash_int_trap() {
+    agent_log "WARN" "Received SIGINT"
+    cleanup_ash 2>/dev/null || true
+    exit 0
+}
+
+_ash_term_trap() {
+    agent_log "WARN" "Received SIGTERM"
+    cleanup_ash 2>/dev/null || true
+    exit 0
+}
+
+# ─── Sourced-Shell Wrapper ───────────────────────────────────────────────────
+# Contract: a sourced profile hook must never terminate the caller, never
+# leave errexit/nounset/pipefail enabled on a failure path, and never return
+# a non-zero status. `main` keeps its non-zero status only for direct
+# execution, where the process owns the shell.
+ash_source_init() {
+    local rc=0
+
+    ash_capture_caller_state
+
+    # Do not let this file's strict-mode settings leak into the caller. main()
+    # performs explicit checks on every step that can fail. functrace/errtrace
+    # are deliberately left as the caller had them; enabling functrace makes
+    # the DEBUG trap re-enter itself (issue #6).
+    set +e +u +o pipefail
+
+    if ! main "$@"; then
+        rc=1
+    fi
+
+    if ((rc != 0)); then
+        ASH_INIT_FAILED=1
+        ASH_DISABLED=true
+        export ASH_DISABLED
+        _ash_note "ERROR" "ASH initialization failed; monitoring is disabled for this session"
+        ash_restore_caller_options false
+        _ash_restore_previous_traps
+        if [[ -n "${_ASH_PREV_BASH_ENV:-}" ]]; then
+            export BASH_ENV="$_ASH_PREV_BASH_ENV"
+        else
+            unset BASH_ENV 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    ash_restore_caller_options true
+
+    # Only replace BASH_ENV when it was unset or already points at ASH.
+    # Clobbering another tool's BASH_ENV would silently break it.
+    if [[ -z "${_ASH_PREV_BASH_ENV:-}" || "${_ASH_PREV_BASH_ENV}" == "${BASH_SOURCE[0]}" ]]; then
+        export BASH_ENV="${BASH_SOURCE[0]}"
+    else
+        _ash_note "WARN" "BASH_ENV already set to $_ASH_PREV_BASH_ENV; not replacing it"
+    fi
+
+    export ASH_INITIALIZED="true"
+
+    # Install the DEBUG/EXIT traps only after all setup is complete, and keep
+    # the depth guard on while doing it so the wrapper's own `trap`/`export`
+    # commands are not logged as user commands. The final `return 0` is
+    # skipped by the handler's built-in-command prefix check.
+    ASH_DEBUG_DEPTH=1
+    ash_install_traps "sourced"
+    if [[ $- == *i* ]]; then
+        # Do not duplicate the hook if this file is sourced twice in one
+        # shell (e.g. by both profile.d and bash.bashrc).
+        case ";${PROMPT_COMMAND:-};" in
+            *";ash_prompt_command;"*) ;;
+            *) PROMPT_COMMAND="ash_prompt_command${PROMPT_COMMAND:+; ${PROMPT_COMMAND}}" ;;
+        esac
+    fi
+    ASH_DEBUG_DEPTH=0
+    return 0
+}
 
 # ─── Main Initialization ─────────���──────────────────────────────────────────
 main() {
-    # Validate configuration.
-    #
-    # `return` (not `exit`) on failure: this function runs both when
-    # ash-agent is executed as its own process (fine to exit — see the
-    # dispatch logic below) and when it is `source`d directly into a
-    # user's interactive login shell via /etc/profile.d/ash.sh. In the
-    # latter case `exit` would terminate the *user's shell*, not just
-    # monitoring — e.g. the stock install.sh directory permissions
-    # (/tmp/ash root:root 700, /var/log/ash root:ash 750 — group has no
-    # write bit) fail this check for every non-root, non-`ash` user,
-    # which meant every such user's login shell used to die immediately.
-    # Returning here just leaves monitoring disabled for the session
-    # instead.
+    local mode="${ASH_AGENT_MODE:-direct}"
+
+    # Validate configuration. The sourced-shell wrapper turns a non-zero
+    # return into "monitoring disabled for this session" and returns 0 to the
+    # caller; direct execution lets the non-zero status exit the process.
     validate_config || return 1
 
-    # Initialize subsystems
-    load_redaction_rules
-    hash_chain_init
-    spool_init
-    recover_state || return 1
+    ash_prepare_log_files || {
+        _ash_note "ERROR" "Cannot create ${ASH_EVENTS_FILE} or ${ASH_AGENT_LOG}"
+        return 1
+    }
 
-    # Save current state
+    # Initialize subsystems. A broken hash chain is fatal: without it the
+    # local log is no longer tamper-evident, so do not pretend to monitor.
+    load_redaction_rules
+    hash_chain_init || {
+        _ash_note "ERROR" "Cannot initialise hash chain at ${ASH_HASH_FILE}"
+        return 1
+    }
+
+    local spool_ok=0
+    if spool_init; then
+        spool_ok=1
+    else
+        _ash_note "WARN" "Kafka spool unavailable at ${ASH_SPOOL_DIR}; local logging continues"
+    fi
+
+    recover_state || true
     save_state
 
-    # Start background monitors
+    # Start background monitors.
     start_file_watcher
     start_container_monitor
     start_auditd_monitor
-    spool_flush_timer
+    if [[ $spool_ok -eq 1 ]]; then
+        spool_flush_timer
+    fi
 
-    # Emit session start
-    emit_session_start
+    # Emit session start. If this fails, local logging is broken; do not
+    # install the DEBUG trap and pretend to monitor.
+    if ! emit_session_start; then
+        _ash_note "ERROR" "Cannot write session_start to ${ASH_EVENTS_FILE}"
+        return 1
+    fi
+    ASH_SESSION_STARTED=1
 
     # Start the systemd liveness heartbeat (no-op outside systemd).
     start_watchdog
 
-    # Set up command trapping
-    trap 'log_command' DEBUG
-
-    # Integrate with PROMPT_COMMAND
-    if [[ -z "${PROMPT_COMMAND:-}" ]]; then
-        PROMPT_COMMAND="ash_prompt_command"
-    else
-        PROMPT_COMMAND="ash_prompt_command; ${PROMPT_COMMAND}"
+    # Set up traps last: every step above must succeed before the caller's
+    # shell gets a DEBUG trap or PROMPT_COMMAND hook. Sourced mode installs
+    # its traps in ash_source_init() after the caller's options are restored;
+    # installing them here would log the wrapper's own setup commands.
+    if [[ "$mode" == "direct" ]]; then
+        ash_install_traps "$mode"
+        export BASH_ENV="${BASH_SOURCE[0]}"
     fi
 
-    agent_log "INFO" "ASH agent v${ASH_VERSION} started on $(hostname) (session: ${ASH_SESSION_ID})"
+    agent_log "INFO" "ASH agent v${ASH_VERSION} started on $(hostname) (session: ${ASH_SESSION_ID}, mode: ${mode}, log: ${ASH_LOG_DIR})"
+    return 0
 }
 
 # Run if sourced or executed.
@@ -1180,41 +1800,40 @@ main() {
 # spool, ...) without bash-only side effects — the DEBUG trap,
 # PROMPT_COMMAND, BASH_ENV propagation into child processes, or the
 # background watchers, all of which the zsh integration sets up itself via
-# preexec/precmd. Previously this flag was accepted by the caller but never
-# implemented here, so sourcing from zsh silently ran the full bash-only
-# main() anyway.
+# preexec/precmd.
 if [[ "${1:-}" == "--functions-only" ]]; then
-    :
+    ASH_AGENT_MODE="functions"
+    # Resolve writable locations so emit_event() works from a non-bash shell
+    # whose configured paths are root-owned. Failures leave the paths as-is;
+    # emit_event() reports the write failure rather than aborting the shell.
+    ash_resolve_temp_dir || true
+    ash_resolve_log_dir || true
+    ash_resolve_spool_dir || true
+    ash_resolve_paths
+    if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+        exit 0
+    fi
+    return 0
 elif [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     # Executed directly (e.g. systemd's ExecStart=/usr/local/bin/ash-agent)
-    # rather than sourced: this is our own process, so it's fine (and, via
-    # `set -e`, automatic) for a main() failure to exit it.
-    export BASH_ENV="${BASH_SOURCE[0]}"
+    # rather than sourced: this is our own process, so a main() failure may
+    # exit it. Strict mode is scoped to this process.
+    ASH_AGENT_MODE="direct"
+    set -euo pipefail
+    set -E
     main "$@"
-elif [[ "${ASH_INITIALIZED:-}" != "true" ]]; then
+    exit $?
+elif [[ "${ASH_INITIALIZED:-}" == "true" ]]; then
+    # A child bash sourced this file through BASH_ENV after the parent agent
+    # already initialized. Define the helper functions, but do not install a
+    # second DEBUG trap, start watchers, or re-run main().
+    ASH_AGENT_MODE="child"
+    return 0
+else
+    # Sourced into someone else's shell (interactive login, or a child bash
+    # process via BASH_ENV). The wrapper guarantees a zero return status and
+    # restores the caller's options/traps on failure.
+    ASH_AGENT_MODE="sourced"
     export ASH_INITIALIZED="true"
-    export BASH_ENV="${BASH_SOURCE[0]}"
-    # Sourced into someone else's shell (interactive login, or a child
-    # bash process via BASH_ENV). On failure, restore the caller's
-    # original shell options (captured as _ASH_CALLER_SHELL_OPTS before
-    # `set -euo pipefail` above) before returning.
-    #
-    # This is not optional polish: `main() { ... return 1; }` alone is
-    # NOT enough to save the caller, even though it looks like it should
-    # be. Confirmed empirically (see issue tracker) — because `set -e`
-    # was enabled by *this* file and never undone, it is still active in
-    # the caller by the time `main "$@"` finishes, and bash checks
-    # errexit against a command's exit status using whatever option
-    # state is active at that check, not the state that was active when
-    # the command started. So a bare `main "$@" || return 1` here would
-    # still trip the caller's (now-enabled) errexit on main's non-zero
-    # return, even though nothing calls `exit` anymore. Restoring the
-    # caller's original options first removes that trap; if the caller
-    # already had errexit on for their own reasons, this restores that
-    # too, so we're not silently overriding an intentional caller
-    # setting — just not leaving one behind that they didn't ask for.
-    if ! main "$@"; then
-        eval "$_ASH_CALLER_SHELL_OPTS" 2>/dev/null || true
-        return 1
-    fi
+    ash_source_init "$@"
 fi
