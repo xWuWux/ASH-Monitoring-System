@@ -31,17 +31,23 @@ jobs:
             -f deployments/docker/docker-compose.resilience.yml \
             up -d --build
 
-      - name: Wait for containers to become healthy
+      - name: Wait for the API and Toxiproxy
         run: |
-          for i in $(seq 1 40); do
-            unhealthy=$(docker ps --filter "health=unhealthy" -q)
-            starting=$(docker ps --filter "health=starting" -q)
-            if [ -z "$unhealthy" ] && [ -z "$starting" ]; then
-              echo "All containers healthy (or have no healthcheck)."
+          # The API's /health/ready checks PostgreSQL; Toxiproxy's /version
+          # proves the proxy is serving. Waiting on these endpoints is proof,
+          # unlike an empty `docker ps --filter health=starting` result on the
+          # first iteration before healthchecks have registered.
+          for i in $(seq 1 60); do
+            api_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+              http://127.0.0.1:8080/health/ready || true)
+            proxy_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+              http://127.0.0.1:8474/version || true)
+            if [ "$api_status" = "200" ] && [ "$proxy_status" = "200" ]; then
+              echo "API and Toxiproxy are ready."
               break
             fi
-            if [ "$i" -eq 40 ]; then
-              echo "Timed out waiting for containers to become healthy."
+            if [ "$i" -eq 60 ]; then
+              echo "Timed out waiting for API/Toxiproxy (api=$api_status proxy=$proxy_status)."
               docker ps
               docker compose \
                 -f deployments/docker/docker-compose.yml \
@@ -81,7 +87,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r src/consumer/requirements.txt pytest "mutmut==3.8.1"
 
-      - name: Run mutation testing (120-minute cap)
+      - name: Run mutation testing (120-minute cap, report-only baseline)
+        # Report-only until a mutation-score threshold is agreed. A timeout or
+        # tool failure should still produce the artifacts below, not a red
+        # nightly for a quality metric that has no gate yet.
+        continue-on-error: true
         run: |
           # setup.cfg limits mutmut to src/consumer and tests/unit/python.
           # DB/Kafka integration suites are excluded; those cannot run once

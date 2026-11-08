@@ -155,3 +155,29 @@ run_sourced() {
     [[ $status -eq 0 ]]
     [[ "$output" == *"BASH_ENV_CLEAN"* ]]
 }
+@test "caller with nounset survives a successful source" {
+    run_sourced '
+        set -u
+        source "$1"
+        [[ $? -eq 0 ]]
+        false || true
+        echo SURVIVED
+    '
+
+    [[ $status -eq 0 ]]
+    [[ "$output" == *"SURVIVED"* ]]
+}
+
+@test "caller with functrace survives and does not get a recursive DEBUG trap" {
+    run_sourced '
+        set -T
+        source "$1"
+        [[ $? -eq 0 ]]
+        [[ -z "$(trap -p DEBUG)" ]] || { echo "DEBUG trap installed"; exit 1; }
+        false || true
+        echo SURVIVED
+    '
+
+    [[ $status -eq 0 ]]
+    [[ "$output" == *"SURVIVED"* ]]
+}

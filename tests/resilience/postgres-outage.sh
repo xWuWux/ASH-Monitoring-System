@@ -37,7 +37,7 @@ fail() {
 wait_for_http() {
     local url="$1" expected="$2" timeout="${3:-60}" i status
     for ((i = 0; i < timeout; i++)); do
-        status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$url" || true)
+        status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$url" || true)
         if [[ "$status" == "$expected" ]]; then
             return 0
         fi
@@ -47,16 +47,27 @@ wait_for_http() {
 }
 
 auth_token() {
+    local payload
+    # Build the JSON with Python instead of string interpolation: a password
+    # containing a quote or backslash would otherwise produce invalid JSON.
+    payload=$(python3 -c '
+import json
+import os
+print(json.dumps({
+    "username": os.environ["ASH_ADMIN_USER"],
+    "password": os.environ["ASH_ADMIN_PASS"],
+}))
+')
     curl -fsS --max-time 10 \
         -X POST "${BASE_URL}/api/v1/auth/token" \
         -H 'Content-Type: application/json' \
-        -d "{\"username\":\"${ASH_ADMIN_USER}\",\"password\":\"${ASH_ADMIN_PASS}\"}" |
+        -d "$payload" |
         python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
 }
 
 api_status() {
     local token="$1" path="$2"
-    curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+    curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
         -H "Authorization: Bearer ${token}" \
         "${BASE_URL}${path}" || true
 }
@@ -94,15 +105,21 @@ curl -fsS --max-time 10 \
 
 total=0
 for _ in 1 2 3 4 5; do
-    elapsed=$(curl -sS -o /dev/null -w '%{time_total}' --max-time 10 \
+    result=$(curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 15 \
         -H "Authorization: Bearer ${token}" \
         "${BASE_URL}/api/v1/events?limit=5")
+    code="${result%% *}"
+    elapsed="${result##* }"
+    [[ "$code" == "200" ]] ||
+        fail "latency run returned HTTP $code, expected 200"
     total=$(awk -v a="$total" -v b="$elapsed" 'BEGIN { printf "%.6f", a + b }')
 done
 average=$(awk -v total="$total" 'BEGIN { printf "%.6f", total / 5 }')
 echo "latency run: average ${average}s across 5 requests"
 awk -v average="$average" 'BEGIN { exit !(average > 0.10) }' ||
     fail "injected latency did not increase response time (average ${average}s)"
+awk -v average="$average" 'BEGIN { exit !(average < 1.00) }' ||
+    fail "latency run hung (average ${average}s, expected < 1.00s)"
 
 cleanup
 wait_for_http "${BASE_URL}/health/ready" 200 60

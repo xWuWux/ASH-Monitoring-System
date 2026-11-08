@@ -41,13 +41,16 @@ about what is implemented, what is deferred, and what still needs a decision.
 
 ### Known risk
 
-`GET /api/v1/events` executes `COUNT(*)` and an `ILIKE '%...%'` scan; the
-existing GIN index is on `to_tsvector`, which the `ILIKE` query cannot use.
-With 500k rows the hard `avg < 200 ms` gate may fail on a 2-core GitHub
-runner. If that happens, do not silently relax the threshold: capture the
-measured p50/p95, add the missing query/index (or change the query), and
-re-baseline. The gate is intentionally strict because it is the requested
-SLO.
+The 24-hour aggregate endpoints are the likely bottleneck, not the events
+list: `/api/v1/hosts` (`COUNT(DISTINCT session_id)`), `/api/v1/stats/timeline`
+and `/api/v1/stats/top-commands` group 500k rows. The k6 events request has no
+`command` filter, so the `ILIKE` path is not exercised by this load test. With
+500k rows the hard `avg < 200 ms` gate may fail on a 2-core GitHub runner even
+after the seed correlates `session_id` with the 20k seeded sessions. If it
+fails, do not silently relax the threshold: capture the measured p50/p95, add
+the missing time/aggregate index or rewrite the query, and re-baseline. The
+gate is intentionally strict because it is the requested SLO; the first main
+run is the calibration run.
 
 There is no reverse proxy in Compose, so 502/504 cannot be produced. The
 failure gate covers 5xx/503, timeouts, and non-JSON responses.
@@ -65,7 +68,8 @@ failure gate covers 5xx/503, timeouts, and non-JSON responses.
     PostgreSQL again and asserts 200 without an API restart.
 - **What is not implemented:** real DB failover (Compose has one PostgreSQL,
   no replica), Kafka outage/reconnect in this script, Chaos Mesh (requires
-  Kubernetes), and Toxiproxy on the consumer→Kafka link.
+  Kubernetes), and Toxiproxy on the consumer→Kafka link. The script name and
+  docs scope this to PostgreSQL; Kafka reconnect remains a separate gap.
 - **CI:** `.github/workflows/nightly.yml` at 03:00 UTC plus manual dispatch.
 
 ## 3. Mutation testing
@@ -80,8 +84,10 @@ failure gate covers 5xx/503, timeouts, and non-JSON responses.
   PostgreSQL or Kafka; running them once per mutant is impractical. The unit
   suite mocks those services.
 - **Runtime:** nightly job, `timeout 7200 mutmut run` (120-minute cap),
-  artifacts uploaded. There is no mutation-score gate yet; the first runs
-  are for baseline and triage.
+  artifacts uploaded. The job is **report-only** (`continue-on-error`) until
+  a mutation-score threshold is agreed; the first runs are for baseline and
+  triage. `mutmut run` exits 0 even with surviving mutants, so a green job
+  without a parsed score is not a quality signal.
 - **Known risk:** mutmut 3.x may not support every Python 3.12 feature used
   by the consumer; if the first run fails during collection, pin the last
   working mutmut version and document it.

@@ -33,6 +33,8 @@ docker compose -f deployments/docker/docker-compose.yml exec -T \
   psql -U ash -d ash_logs -v ON_ERROR_STOP=1 \
   < tests/performance/k6/seed.sql
 
+mkdir -p k6-results
+
 ASH_API_BASE_URL=http://127.0.0.1:8080 \
 ASH_ADMIN_USER=admin \
 ASH_ADMIN_PASS='the-generated-password' \

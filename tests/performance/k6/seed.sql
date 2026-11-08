@@ -10,7 +10,7 @@
 -- aggregate 24 hours of data, and /stats/timeline and /stats/top-commands
 -- must group the full set.
 
-TRUNCATE TABLE command_logs, file_changes, sessions RESTART IDENTITY;
+TRUNCATE TABLE alerts, command_logs, file_changes, sessions RESTART IDENTITY;
 
 INSERT INTO sessions (
     session_id,
@@ -24,7 +24,7 @@ INSERT INTO sessions (
     event_count
 )
 SELECT
-    gen_random_uuid(),
+    md5(i::text)::uuid,
     'bench-host-' || (i % 20),
     'bench-user',
     now() - (random() * interval '24 hours'),
@@ -65,7 +65,7 @@ SELECT
     'command_start',
     'bench-user',
     1000,
-    gen_random_uuid(),
+    md5(((i % 20000) + 1)::text)::uuid,
     1000 + i,
     999,
     '/dev/pts/0',
@@ -98,7 +98,7 @@ SELECT
     now() - (random() * interval '24 hours'),
     'bench-host-' || (i % 20),
     'bench-user',
-    gen_random_uuid(),
+    md5(((i % 20000) + 1)::text)::uuid,
     '/tmp/bench-' || (i % 1000),
     'modify',
     '--- a/bench\n+++ b/bench\n@@ -1 +1 @@\n-old\n+new',
