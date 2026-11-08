@@ -160,6 +160,12 @@ run_sourced() {
         set -u
         source "$1"
         [[ $? -eq 0 ]]
+        # Prove nounset is still active: referencing an unset variable must
+        # terminate the subshell, not silently expand to empty.
+        if ( : "$ASH_TEST_UNSET_VAR" ) 2>/dev/null; then
+            echo "nounset is not active"
+            exit 1
+        fi
         false || true
         echo SURVIVED
     '

@@ -27,13 +27,17 @@ about what is implemented, what is deferred, and what still needs a decision.
   - `/api/v1/sessions?limit=50`
 - **Load:** 20 constant VUs for 60 seconds; each VU cycles through all
   endpoints with 100 ms think time.
-- **Hard gates:** average `< 200 ms`, p95 `< 500 ms`, failed requests
-  `< 1%`, checks `> 99%` per endpoint. The first 2–3 main runs are
-  **report-only** (`K6_ENFORCE=false`) so the baseline can be measured
-  without a red main; flip `K6_ENFORCE=true` in `ci.yml` once the measured
-  p50/p95 proves the gates are achievable on the runner.
+- **Target gates (report-only during calibration):** average `< 200 ms`,
+  p95 `< 500 ms`, failed requests `< 1%`, checks `> 99%` per endpoint. The
+  first 2–3 main runs are **report-only** (`K6_ENFORCE=false`) so the
+  baseline can be measured without a red main; flip `K6_ENFORCE=true` in
+  `ci.yml` once three consecutive main runs show p95 below the gate with
+  margin. Do not call them enforced while `K6_ENFORCE=false`.
 - **Seed:** `tests/performance/k6/seed.sql` inserts 500,000 `command_logs`
-  rows (20 hosts, 24 hours), 20,000 `sessions`, and 50,000 `file_changes`.
+  rows over 30 days (20 hosts, ~16.7k in the last 24 hours), 20,000
+  `sessions`, and 50,000 `file_changes`. Spreading the rows makes the
+  24-hour window selective for `idx_cmd_logs_log_timestamp`; a dense 500k
+  window defeats that index and turns the test into a worst-case seq scan.
   The seed **truncates** the tables and is test-only.
 - **CI trigger:** existing `ephemeral-deploy-benchmarks` job, which runs on
   push to `main` and manual dispatch. It is not in the required-to-merge
@@ -53,7 +57,9 @@ after the seed correlates `session_id` with the 20k seeded sessions. If it
 fails, do not silently relax the threshold: capture the measured p50/p95, add
 the missing time/aggregate index or rewrite the query, and re-baseline. The
 gate is intentionally strict because it is the requested SLO; the first 2–3
-main runs are the calibration window and run with `K6_ENFORCE=false`.
+main runs are the calibration window and run with `K6_ENFORCE=false`. A
+30-day seed plus `idx_cmd_logs_log_timestamp` is the minimum schema support
+for the 24-hour queries; materialized rollups are a separate product change.
 
 There is no reverse proxy in Compose, so 502/504 cannot be produced. The
 failure gate covers 5xx/503, timeouts, and non-JSON responses.
@@ -74,6 +80,10 @@ failure gate covers 5xx/503, timeouts, and non-JSON responses.
   Kubernetes), and Toxiproxy on the consumer→Kafka link. The script name and
   docs scope this to PostgreSQL; Kafka reconnect remains a separate gap.
 - **CI:** `.github/workflows/nightly.yml` at 03:00 UTC plus manual dispatch.
+  The k6 load test is **not** in this nightly workflow; it remains in
+  `ci.yml` on main push/manual. GitHub only registers a scheduled workflow
+  after it exists on the default branch, so the first nightly run is only
+  possible after `nightly.yml` lands on `main`.
 
 ## 3. Mutation testing
 

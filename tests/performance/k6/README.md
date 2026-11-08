@@ -1,8 +1,9 @@
 # k6 API load test
 
 Runs authenticated load against the Docker Compose API after
-`tests/performance/k6/seed.sql` has inserted 500,000 command rows, 20,000
-sessions, and 50,000 file changes.
+`tests/performance/k6/seed.sql` has inserted 500,000 command rows over
+30 days, 20,000 sessions, and 50,000 file changes. The last 24 hours contain
+roughly 16.7k command rows, which keeps the time-window queries selective.
 
 ## What it covers
 
@@ -14,7 +15,7 @@ sessions, and 50,000 file changes.
 | `stats_top_commands` | `GET /api/v1/stats/top-commands?hours=24&limit=20` |
 | `sessions` | `GET /api/v1/sessions?limit=50` |
 
-Each endpoint has its own hard threshold:
+Each endpoint has its own target threshold:
 
 - average response time `< 200 ms`
 - p95 `< 500 ms`
@@ -38,8 +39,8 @@ docker compose -f deployments/docker/docker-compose.yml exec -T \
 mkdir -p k6-results
 
 ASH_API_BASE_URL=http://127.0.0.1:8080 \
-ASH_ADMIN_USER=admin \
-ASH_ADMIN_PASS='the-generated-password' \
+ASH_ADMIN_USER="${ASH_ADMIN_USER:?set ASH_ADMIN_USER}" \
+ASH_ADMIN_PASS="${ASH_ADMIN_PASS:?set ASH_ADMIN_PASS}" \
 K6_VUS=20 K6_DURATION=60s \
 k6 run --summary-export=k6-results/summary.json \
   tests/performance/k6/api-load.js

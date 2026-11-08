@@ -1,3 +1,7 @@
+> Historical review transcript. Line numbers and findings refer to the
+> commits named in the text; verify them against HEAD before acting. Kept for
+> design history, not as current documentation.
+
 # ASH Test Strategy Review
 
 ## Verdict

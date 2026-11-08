@@ -4,11 +4,12 @@
 -- deployment. It is executed against the disposable Compose PostgreSQL
 -- volume created by .github/workflows/ci.yml.
 --
--- 500,000 command_logs rows across 20 hosts and 24 hours, 20,000 sessions,
--- and 50,000 file_changes rows. The volume is deliberately large enough that
--- GET /api/v1/events must execute its COUNT(*) and ILIKE scan, /hosts must
--- aggregate 24 hours of data, and /stats/timeline and /stats/top-commands
--- must group the full set.
+-- 500,000 command_logs rows across 20 hosts and 30 days (~16.7k in the last
+-- 24 hours), 20,000 sessions, and 50,000 file_changes rows. The volume is deliberately large enough that
+-- GET /api/v1/events must execute its list + COUNT(*), /hosts must
+-- aggregate the last 24 hours, and /stats/timeline and /stats/top-commands
+-- must group the last 24 hours. The ILIKE search path is not exercised
+-- because the load request has no command filter.
 
 TRUNCATE TABLE alerts, command_logs, file_changes, sessions RESTART IDENTITY;
 
@@ -27,7 +28,7 @@ SELECT
     md5(i::text)::uuid,
     'bench-host-' || (i % 20),
     'bench-user',
-    now() - (random() * interval '24 hours'),
+    now() - (random() * interval '30 days'),
     now(),
     '10.0.0.1 52341 10.0.0.2 22',
     '/dev/pts/0',
@@ -77,7 +78,7 @@ SELECT
     substr(md5((i + 1)::text), 1, 16),
     ts
 FROM (
-    SELECT i, now() - (random() * interval '24 hours') AS ts
+    SELECT i, now() - (random() * interval '30 days') AS ts
     FROM generate_series(1, 500000) AS g(i)
 ) AS seeded;
 
@@ -95,7 +96,7 @@ INSERT INTO file_changes (
 )
 SELECT
     gen_random_uuid(),
-    now() - (random() * interval '24 hours'),
+    now() - (random() * interval '30 days'),
     'bench-host-' || (i % 20),
     'bench-user',
     md5(((i % 20000) + 1)::text)::uuid,

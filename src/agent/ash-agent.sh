@@ -1636,7 +1636,7 @@ ash_install_traps() {
         # re-enter itself. Monitoring is disabled for that session instead of
         # hanging or killing the caller's shell.
         if [[ $- == *T* ]]; then
-            _ash_note "WARN" "functrace is enabled in the caller; ASH DEBUG monitoring is disabled for this session"
+            agent_log "WARN" "functrace is enabled in the caller; ASH DEBUG monitoring is disabled for this session"
         else
             trap '_ash_debug_trap' DEBUG
         fi

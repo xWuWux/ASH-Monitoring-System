@@ -72,6 +72,21 @@ api_status() {
         "${BASE_URL}${path}" || true
 }
 
+measure_events_avg() {
+    local token="$1" total=0 i result code elapsed
+    for i in 1 2 3 4 5; do
+        result=$(curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 15 \
+            -H "Authorization: Bearer ${token}" \
+            "${BASE_URL}/api/v1/events?limit=5")
+        code="${result%% *}"
+        elapsed="${result##* }"
+        [[ "$code" == "200" ]] ||
+            fail "events request returned HTTP $code, expected 200"
+        total=$(awk -v a="$total" -v b="$elapsed" 'BEGIN { printf "%.6f", a + b }')
+    done
+    awk -v total="$total" 'BEGIN { printf "%.6f", total / 5 }'
+}
+
 cleanup() {
     curl -fsS -X DELETE "${TOXIPROXY_URL}/proxies/postgres/toxics/latency" \
         >/dev/null 2>&1 || true
@@ -90,7 +105,8 @@ token=$(auth_token)
 baseline_status=$(api_status "$token" "/api/v1/events?limit=5")
 [[ "$baseline_status" == "200" ]] ||
     fail "baseline /api/v1/events returned $baseline_status, expected 200"
-echo "baseline: API and database are healthy"
+baseline_avg=$(measure_events_avg "$token")
+echo "baseline: API and database are healthy (average ${baseline_avg}s across 5 requests)"
 
 # ─── Latency injection ───────────────────────────────────────────────────────
 echo "Injecting 200 ms ± 50 ms latency on API -> PostgreSQL..."
@@ -103,23 +119,24 @@ curl -fsS --max-time 10 \
     -d '{"name":"latency","type":"latency","attributes":{"latency":200,"jitter":50}}' \
     >/dev/null
 
-total=0
-for _ in 1 2 3 4 5; do
-    result=$(curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 15 \
-        -H "Authorization: Bearer ${token}" \
-        "${BASE_URL}/api/v1/events?limit=5")
-    code="${result%% *}"
-    elapsed="${result##* }"
-    [[ "$code" == "200" ]] ||
-        fail "latency run returned HTTP $code, expected 200"
-    total=$(awk -v a="$total" -v b="$elapsed" 'BEGIN { printf "%.6f", a + b }')
-done
-average=$(awk -v total="$total" 'BEGIN { printf "%.6f", total / 5 }')
-echo "latency run: average ${average}s across 5 requests"
-awk -v average="$average" 'BEGIN { exit !(average > 0.10) }' ||
-    fail "injected latency did not increase response time (average ${average}s)"
-awk -v average="$average" 'BEGIN { exit !(average < 1.00) }' ||
-    fail "latency run hung (average ${average}s, expected < 1.00s)"
+# Prove the toxic exists; a missing proxy/toxic would otherwise make the
+# timing assertion pass or fail for the wrong reason.
+curl -fsS --max-time 10 "${TOXIPROXY_URL}/proxies/postgres/toxics" |
+    python3 -c '
+import json
+import sys
+toxics = json.load(sys.stdin)
+if not any(t.get("name") == "latency" for t in toxics):
+    raise SystemExit("latency toxic is not present")
+'
+
+injected_avg=$(measure_events_avg "$token")
+echo "latency run: average ${injected_avg}s across 5 requests (baseline ${baseline_avg}s)"
+awk -v injected="$injected_avg" -v baseline="$baseline_avg" \
+    'BEGIN { exit !(injected >= baseline + 0.10) }' ||
+    fail "injected latency did not increase response time (baseline ${baseline_avg}s, injected ${injected_avg}s)"
+awk -v injected="$injected_avg" 'BEGIN { exit !(injected < 1.00) }' ||
+    fail "latency run hung (average ${injected_avg}s, expected < 1.00s)"
 
 cleanup
 wait_for_http "${BASE_URL}/health/ready" 200 60

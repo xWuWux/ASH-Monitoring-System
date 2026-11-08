@@ -844,6 +844,11 @@ class ASHConsumer:
                     ON command_logs (event_id);
                 CREATE INDEX IF NOT EXISTS idx_cmd_logs_trace
                     ON command_logs (trace_id);
+                -- Time-bounded list/aggregate queries (events list, /hosts,
+                -- /stats/timeline) filter on log_timestamp. Without this,
+                -- PostgreSQL has no selective path for the 24-hour window.
+                CREATE INDEX IF NOT EXISTS idx_cmd_logs_log_timestamp
+                    ON command_logs (log_timestamp DESC);
 
                 CREATE TABLE IF NOT EXISTS file_changes (
                     id SERIAL PRIMARY KEY,
