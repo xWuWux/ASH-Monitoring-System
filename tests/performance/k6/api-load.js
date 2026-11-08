@@ -12,6 +12,7 @@
 
 import http from "k6/http";
 import { check, sleep } from "k6";
+import { Rate, Trend } from "k6/metrics";
 
 const BASE_URL = (__ENV.ASH_API_BASE_URL || "http://127.0.0.1:8080").replace(
     /\/$/,
@@ -38,6 +39,7 @@ const ENDPOINTS = [
 // if the shared GitHub runner cannot meet them with 500k seeded rows, report
 // the measured values rather than silently weakening the gate.
 const thresholds = {};
+const endpointMetrics = {};
 for (const endpoint of ENDPOINTS) {
     thresholds[`http_req_duration{endpoint:${endpoint.name}}`] = [
         "avg<200",
@@ -45,6 +47,19 @@ for (const endpoint of ENDPOINTS) {
     ];
     thresholds[`http_req_failed{endpoint:${endpoint.name}}`] = ["rate<0.01"];
     thresholds[`checks{endpoint:${endpoint.name}}`] = ["rate>0.99"];
+    // The built-in tagged metrics are not included in --summary-export on
+    // this k6 version. Custom per-endpoint Trend/Rate metrics make the
+    // baseline visible in k6-results/summary.json and in the threshold
+    // names when K6_ENFORCE=true.
+    endpointMetrics[endpoint.name] = {
+        duration: new Trend(`endpoint_duration_${endpoint.name}`, true),
+        failed: new Rate(`endpoint_failed_${endpoint.name}`),
+    };
+    thresholds[`endpoint_duration_${endpoint.name}`] = [
+        "avg<200",
+        "p(95)<500",
+    ];
+    thresholds[`endpoint_failed_${endpoint.name}`] = ["rate<0.01"];
 }
 
 export const options = {
@@ -99,7 +114,7 @@ export default function (data) {
             timeout: "10s",
         });
 
-        check(
+        const passed = check(
             response,
             {
                 "status is 200": (r) => r.status === 200,
@@ -110,6 +125,10 @@ export default function (data) {
             },
             { endpoint: endpoint.name },
         );
+
+        const metrics = endpointMetrics[endpoint.name];
+        metrics.duration.add(response.timings.duration);
+        metrics.failed.add(passed ? 0 : 1);
     }
 
     // A short think time keeps the test closer to an interactive client and
