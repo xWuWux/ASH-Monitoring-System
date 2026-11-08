@@ -55,14 +55,30 @@ run_validate_config() {
     [[ $status -eq 0 ]]
 }
 
-@test "validate_config fails with unwritable log dir" {
+@test "validate_config fails with unwritable log dir in strict mode" {
     # A path whose parent is a regular file fails even when the suite runs as
     # root, unlike an unwritable directory (root bypasses permission bits).
+    # Strict mode is what the systemd unit uses: a broken host must fail
+    # loudly instead of silently writing to a per-user fallback.
     local blocker="${BATS_TEST_TMPDIR}/not-a-directory"
     : >"$blocker"
     export ASH_LOG_DIR="${blocker}/logs"
+    export ASH_STRICT_PERMISSIONS=true
+    export ASH_ALLOW_HOME_FALLBACK=false
     run_validate_config
     [[ $status -ne 0 ]]
+}
+
+@test "validate_config falls back to a private per-user log dir" {
+    local blocker="${BATS_TEST_TMPDIR}/not-a-directory"
+    : >"$blocker"
+    export ASH_LOG_DIR="${blocker}/logs"
+    export ASH_USER_LOG_ROOT="${BATS_TEST_TMPDIR}/users"
+    export ASH_ALLOW_HOME_FALLBACK=false
+    mkdir -p "$ASH_USER_LOG_ROOT"
+    chmod 1733 "$ASH_USER_LOG_ROOT"
+    run_validate_config
+    [[ $status -eq 0 ]]
 }
 
 @test "validate_config warns when Kafka enabled without broker" {
