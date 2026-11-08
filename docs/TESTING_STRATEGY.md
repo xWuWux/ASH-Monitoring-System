@@ -61,6 +61,28 @@ main runs are the calibration window and run with `K6_ENFORCE=false`. A
 30-day seed plus `idx_cmd_logs_log_timestamp` is the minimum schema support
 for the 24-hour queries; materialized rollups are a separate product change.
 
+### Calibration baseline (run 42503052348)
+
+First report-only main/manual run: commit `4f64d67`, 20 VUs, 60 s, 500k
+rows spread over 30 days, `idx_cmd_logs_log_timestamp` present. All
+endpoints returned HTTP 200; `checks` = 1.0 and `endpoint_failed` = 0 for
+every endpoint. Latency, however, is above the target:
+
+| Endpoint | avg | p95 |
+|---|---:|---:|
+| `/api/v1/events?limit=50` | 282 ms | 417 ms |
+| `/api/v1/hosts` | 370 ms | 554 ms |
+| `/api/v1/sessions?limit=50` | 273 ms | 386 ms |
+| `/api/v1/stats/timeline?hours=24` | 407 ms | 578 ms |
+| `/api/v1/stats/top-commands?hours=24&limit=20` | 403 ms | 572 ms |
+
+This confirms the gate is not achievable yet. The API opens a new
+PostgreSQL connection per request (`src/consumer/api_server.py:243-244`), so
+connection setup and four synchronous gunicorn workers dominate before the
+query plan matters. Do not flip `K6_ENFORCE=true` until the API has a
+connection pool and/or the 24-hour aggregates are pre-computed, then rerun
+and record three consecutive baselines. Track this in issue #69.
+
 There is no reverse proxy in Compose, so 502/504 cannot be produced. The
 failure gate covers 5xx/503, timeouts, and non-JSON responses.
 
