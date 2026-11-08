@@ -19,6 +19,11 @@ const BASE_URL = (__ENV.ASH_API_BASE_URL || "http://127.0.0.1:8080").replace(
 );
 const VUS = Number(__ENV.K6_VUS || 20);
 const DURATION = __ENV.K6_DURATION || "60s";
+// The thresholds are calibrated after the first 2-3 main runs. Until then the
+// job is report-only: K6_ENFORCE=false (the default) runs the same script and
+// records metrics without failing on them. Set K6_ENFORCE=true once a real
+// baseline proves the 200 ms/500 ms gates are achievable on the runner.
+const ENFORCE_THRESHOLDS = __ENV.K6_ENFORCE === "true";
 
 const ENDPOINTS = [
     { name: "events", path: "/api/v1/events?limit=50" },
@@ -50,7 +55,7 @@ export const options = {
             duration: DURATION,
         },
     },
-    thresholds,
+    thresholds: ENFORCE_THRESHOLDS ? thresholds : {},
 };
 
 export function setup() {

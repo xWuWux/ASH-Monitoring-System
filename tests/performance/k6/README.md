@@ -21,8 +21,10 @@ Each endpoint has its own hard threshold:
 - failed requests `< 1%`
 - checks (status 200 + JSON content type) `> 99%`
 
-k6 exits non-zero when any threshold fails, so the CI job fails rather than
-silently producing a report.
+The first 2–3 main runs are **report-only**: CI sets `K6_ENFORCE=false`, so
+the same metrics are collected without failing the job. Once a baseline proves
+the gates are achievable on the runner, set `K6_ENFORCE=true` in `ci.yml`.
+When enforced, k6 exits non-zero on a threshold failure.
 
 ## Local run
 

@@ -28,7 +28,10 @@ about what is implemented, what is deferred, and what still needs a decision.
 - **Load:** 20 constant VUs for 60 seconds; each VU cycles through all
   endpoints with 100 ms think time.
 - **Hard gates:** average `< 200 ms`, p95 `< 500 ms`, failed requests
-  `< 1%`, checks `> 99%` per endpoint. k6 exits non-zero on failure.
+  `< 1%`, checks `> 99%` per endpoint. The first 2–3 main runs are
+  **report-only** (`K6_ENFORCE=false`) so the baseline can be measured
+  without a red main; flip `K6_ENFORCE=true` in `ci.yml` once the measured
+  p50/p95 proves the gates are achievable on the runner.
 - **Seed:** `tests/performance/k6/seed.sql` inserts 500,000 `command_logs`
   rows (20 hosts, 24 hours), 20,000 `sessions`, and 50,000 `file_changes`.
   The seed **truncates** the tables and is test-only.
@@ -49,8 +52,8 @@ and `/api/v1/stats/top-commands` group 500k rows. The k6 events request has no
 after the seed correlates `session_id` with the 20k seeded sessions. If it
 fails, do not silently relax the threshold: capture the measured p50/p95, add
 the missing time/aggregate index or rewrite the query, and re-baseline. The
-gate is intentionally strict because it is the requested SLO; the first main
-run is the calibration run.
+gate is intentionally strict because it is the requested SLO; the first 2–3
+main runs are the calibration window and run with `K6_ENFORCE=false`.
 
 There is no reverse proxy in Compose, so 502/504 cannot be produced. The
 failure gate covers 5xx/503, timeouts, and non-JSON responses.

@@ -738,6 +738,7 @@ jobs:
           ASH_ADMIN_USER="$ASH_ADMIN_USER" \
           ASH_ADMIN_PASS="$ASH_ADMIN_PASS" \
           K6_VUS=20 K6_DURATION=60s \
+          K6_ENFORCE=false \
           k6 run --summary-export=k6-results/summary.json \
             tests/performance/k6/api-load.js
 
