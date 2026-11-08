@@ -675,7 +675,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: [build-package]
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       ASH_DB_PASSWORD: ci-ephemeral-test-password
       ASH_JWT_SECRET: ci-ephemeral-test-jwt-secret-not-for-real-use
@@ -709,14 +709,46 @@ jobs:
       - name: Smoke test the API
         run: curl -fsS http://localhost:8080/health
 
-      - name: Run performance benchmark
+      - name: Seed benchmark data
+        run: |
+          # 500k command_logs rows, 20k sessions, 50k file_changes. TEST ONLY:
+          # seed.sql truncates these tables.
+          docker compose -f deployments/docker/docker-compose.yml exec -T \
+            -e PGPASSWORD="$ASH_DB_PASSWORD" postgres \
+            psql -U ash -d ash_logs -v ON_ERROR_STOP=1 \
+            < tests/performance/k6/seed.sql
+
+      - name: Install k6 (pinned binary + SHA-256)
+        run: |
+          curl -fsSL -o /tmp/k6.tar.gz \
+            https://github.com/grafana/k6/releases/download/v0.54.0/k6-v0.54.0-linux-amd64.tar.gz
+          echo "c7f03434854f837b6790ee81572e4b0f955241974c79a43cbb9f8d0fef069589  /tmp/k6.tar.gz" \
+            | sha256sum -c -
+          tar -xzf /tmp/k6.tar.gz -C /tmp
+          sudo install -m 755 /tmp/k6-v0.54.0-linux-amd64/k6 /usr/local/bin/k6
+          k6 version
+
+      - name: Run agent pipeline benchmark
         run: bash tests/performance/benchmark.sh 1000 | tee benchmark-results.txt
 
-      - name: Upload benchmark results
+      - name: Run k6 API load test
+        run: |
+          mkdir -p k6-results
+          ASH_API_BASE_URL=http://127.0.0.1:8080 \
+          ASH_ADMIN_USER="$ASH_ADMIN_USER" \
+          ASH_ADMIN_PASS="$ASH_ADMIN_PASS" \
+          K6_VUS=20 K6_DURATION=60s \
+          k6 run --summary-export=k6-results/summary.json \
+            tests/performance/k6/api-load.js
+
+      - name: Upload performance artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: performance-benchmark-results
-          path: benchmark-results.txt
+          name: performance-results
+          path: |
+            benchmark-results.txt
+            k6-results/
 
       - name: Tear down the stack
         if: always()
