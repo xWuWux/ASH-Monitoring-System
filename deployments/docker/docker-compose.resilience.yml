@@ -1,0 +1,35 @@
+# Resilience-test override for the ASH Compose stack.
+#
+# Adds Toxiproxy between the API and PostgreSQL so a nightly job can inject
+# latency/jitter without changing the production Compose file. The consumer
+# keeps its direct PostgreSQL connection; only the API's DB path is proxied.
+#
+# Usage:
+#   docker compose \
+#     -f deployments/docker/docker-compose.yml \
+#     -f deployments/docker/docker-compose.resilience.yml \
+#     up -d --build
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    # The image entrypoint is /toxiproxy and its default Cmd contains
+    # -host=0.0.0.0. Replacing Cmd with only -config drops that flag and binds
+    # the admin API to localhost, so host-side curls cannot reach it.
+    command: ["-host=0.0.0.0", "-config", "/etc/toxiproxy/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy.json:/etc/toxiproxy/toxiproxy.json:ro
+    ports:
+      - "8474:8474"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ash-api:
+    environment:
+      ASH_DATABASE_URL: postgresql://ash:${ASH_DB_PASSWORD:?Set ASH_DB_PASSWORD}@toxiproxy:5432/ash_logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_started

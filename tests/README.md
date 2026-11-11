@@ -17,8 +17,10 @@ every push and pull request.
 | `tests/contract/` | API response contract against real PostgreSQL: every endpoint, filters, pagination, invalid input, RBAC |
 | `tests/smoke/smoke-api.sh` | Real gunicorn API + PostgreSQL: health, auth, search, RBAC rejection, load check |
 | `tests/integration/kafka-e2e.sh` | Real Kafka + Zookeeper + PostgreSQL: agent producer → broker → Python consumer → DB row, with raw-text storage and hash-recomputation assertions |
-| `tests/performance/load_api.py` | 50 concurrent `GET /api/v1/events` requests, p95 < 500ms |
+| `tests/performance/load_api.py` | 50 concurrent `GET /api/v1/events` requests, p95 < 500ms (every PR) |
 | `tests/performance/benchmark.sh` | Report-only hash-chain + redaction throughput |
+| `tests/performance/k6/api-load.js` | 20-VU, 60s authenticated load across events/hosts/stats/sessions; per-endpoint avg < 200ms, p95 < 500ms, failures < 1% (main/manual ephemeral job) |
+| `tests/resilience/postgres-outage.sh` | Nightly PostgreSQL stop/start and API→PostgreSQL Toxiproxy latency; expects 503 during outage and 200 after recovery |
 
 ## Running locally
 
@@ -52,7 +54,33 @@ bash tests/smoke/smoke-api.sh
 export ASH_DATABASE_URL='postgresql://ash:password@localhost:5432/ash_logs'
 export ASH_KAFKA_BROKER='127.0.0.1:9092'
 bash tests/integration/kafka-e2e.sh
+
+# k6 API load test (needs the Compose stack and seeded data; see
+# tests/performance/k6/README.md)
+ASH_API_BASE_URL='http://127.0.0.1:8080' \
+ASH_ADMIN_USER='admin' ASH_ADMIN_PASS='...' \
+K6_VUS=20 K6_DURATION=60s \
+    k6 run tests/performance/k6/api-load.js
+
+# Resilience test (needs the Compose stack plus the resilience override)
+export ASH_DB_PASSWORD='...' ASH_JWT_SECRET='...'
+export ASH_ADMIN_USER='admin' ASH_ADMIN_PASS='...'
+docker compose \
+    -f deployments/docker/docker-compose.yml \
+    -f deployments/docker/docker-compose.resilience.yml \
+    up -d --build
+bash tests/resilience/postgres-outage.sh
+
+# Mutation testing (nightly; setup.cfg limits it to src/consumer and
+# tests/unit/python)
+pip install -r src/consumer/requirements.txt pytest 'mutmut==3.8.1'
+mutmut run
+mutmut results
 ```
+
+`tests/performance/k6/README.md` documents the load thresholds and the
+500k-row seed. `.github/workflows/nightly.yml` runs the resilience and
+mutation jobs at 03:00 UTC; the k6 job remains in `ci.yml` on main/manual.
 
 ## Security scanning
 

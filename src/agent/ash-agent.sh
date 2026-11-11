@@ -1630,7 +1630,16 @@ ash_install_traps() {
         # Top-level user commands are still captured, which is what an
         # interactive shell actually needs. Full function/subshell coverage is
         # the job of the auditd layer, not the DEBUG trap.
-        trap '_ash_debug_trap' DEBUG
+        #
+        # If the caller already enabled functrace for its own reasons, do not
+        # install the DEBUG trap at all: restoring `-T` would make the handler
+        # re-enter itself. Monitoring is disabled for that session instead of
+        # hanging or killing the caller's shell.
+        if [[ $- == *T* ]]; then
+            agent_log "WARN" "functrace is enabled in the caller; ASH DEBUG monitoring is disabled for this session"
+        else
+            trap '_ash_debug_trap' DEBUG
+        fi
     fi
 
     if [[ "$mode" == "direct" ]]; then

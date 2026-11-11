@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 from kafka import KafkaConsumer
+from kafka.structs import OffsetAndMetadata, TopicPartition
 
 # kafka-python 3.0 removed NoBrokersAvailableError: a broker-unreachable
 # KafkaConsumer(...) construction now raises KafkaTimeoutError instead. See
@@ -428,6 +429,10 @@ class ASHConsumer:
         # means the event did not arrive through the Kafka loop (tests).
         self.batch_buffer: List[Dict] = []
         self.batch_raw_texts: List[Optional[str]] = []
+        # Parallel to batch_buffer: (topic, partition, next_offset) for each
+        # message. None means the batch was populated by a test or a caller
+        # that did not come through the Kafka loop.
+        self.batch_offsets: List[Optional[Tuple[str, int, int]]] = []
         self.batch_size: int = self.config.get("batch_size", 100)
         self.batch_timeout: float = self.config.get("batch_timeout", 5.0)
         self.last_flush: float = time.time()
@@ -446,6 +451,13 @@ class ASHConsumer:
         # consumer-loop thread, which is the only thread allowed to call
         # self.consumer.commit() -- KafkaConsumer is not thread-safe.
         self._commit_pending = threading.Event()
+
+        # Explicit offsets to commit, captured only after the batch that
+        # contained them was durably written. ``commit()`` without arguments
+        # advances to the consumer's current position, which can include
+        # messages that are still only in batch_buffer.
+        self._pending_commits: Dict[Tuple[str, int], int] = {}
+        self._commit_lock = threading.Lock()
 
         # Storage (log_dir was created before logging was configured)
         # Dead-letter queue: events that fail schema validation were
@@ -844,6 +856,11 @@ class ASHConsumer:
                     ON command_logs (event_id);
                 CREATE INDEX IF NOT EXISTS idx_cmd_logs_trace
                     ON command_logs (trace_id);
+                -- Time-bounded list/aggregate queries (events list, /hosts,
+                -- /stats/timeline) filter on log_timestamp. Without this,
+                -- PostgreSQL has no selective path for the 24-hour window.
+                CREATE INDEX IF NOT EXISTS idx_cmd_logs_log_timestamp
+                    ON command_logs (log_timestamp DESC);
 
                 CREATE TABLE IF NOT EXISTS file_changes (
                     id SERIAL PRIMARY KEY,
@@ -1092,7 +1109,10 @@ class ASHConsumer:
         return False
 
     def process_message(
-        self, log_data: Dict[str, Any], raw_event_text: Optional[str] = None
+        self,
+        log_data: Dict[str, Any],
+        raw_event_text: Optional[str] = None,
+        offset_info: Optional[Tuple[str, int, int]] = None,
     ):
         """Process one event inside its reconstructed trace context.
 
@@ -1122,10 +1142,13 @@ class ASHConsumer:
                     "ash.source": str(source),
                 },
             ):
-                self._process_message(log_data, raw_event_text)
+                self._process_message(log_data, raw_event_text, offset_info)
 
     def _process_message(
-        self, log_data: Dict[str, Any], raw_event_text: Optional[str] = None
+        self,
+        log_data: Dict[str, Any],
+        raw_event_text: Optional[str] = None,
+        offset_info: Optional[Tuple[str, int, int]] = None,
     ):
         """Validate, deduplicate, alert on, and buffer one event."""
         try:
@@ -1173,6 +1196,7 @@ class ASHConsumer:
             with self.batch_lock:
                 self.batch_buffer.append(log_data)
                 self.batch_raw_texts.append(raw_event_text)
+                self.batch_offsets.append(offset_info)
                 BATCH_SIZE_GAUGE.set(len(self.batch_buffer))
                 should_flush = len(self.batch_buffer) >= self.batch_size
 
@@ -1210,14 +1234,20 @@ class ASHConsumer:
                 return
             batch = self.batch_buffer[:]
             raw_texts = self.batch_raw_texts[:]
+            offsets = list(getattr(self, "batch_offsets", []))[:]
             # Tests and older callers can populate batch_buffer directly.
-            # Keep the two lists aligned rather than dropping raw text.
+            # Keep all parallel lists aligned rather than dropping data.
             if len(raw_texts) < len(batch):
                 raw_texts.extend([None] * (len(batch) - len(raw_texts)))
             elif len(raw_texts) > len(batch):
                 raw_texts = raw_texts[: len(batch)]
+            if len(offsets) < len(batch):
+                offsets.extend([None] * (len(batch) - len(offsets)))
+            elif len(offsets) > len(batch):
+                offsets = offsets[: len(batch)]
             self.batch_buffer = []
             self.batch_raw_texts = []
+            self.batch_offsets = []
             BATCH_SIZE_GAUGE.set(0)
 
         start_time = time.time()
@@ -1264,6 +1294,7 @@ class ASHConsumer:
                 # a size-triggered flush (main thread) and a timeout-triggered
                 # flush (background flush-timer thread) -- threading.Event is
                 # itself thread-safe, so this needs no lock.
+                self._record_persisted_offsets(offsets)
                 self._commit_pending.set()
 
             except Exception as e:
@@ -1285,11 +1316,77 @@ class ASHConsumer:
                 with self.batch_lock:
                     self.batch_buffer = batch + self.batch_buffer
                     self.batch_raw_texts = raw_texts + self.batch_raw_texts
+                    self.batch_offsets = offsets + self.batch_offsets
                     BATCH_SIZE_GAUGE.set(len(self.batch_buffer))
                 EVENTS_FAILED.labels(reason="flush_error").inc()
                 self._refresh_readiness()
 
         BATCH_FLUSH_LATENCY.observe(time.time() - start_time)
+
+    def _record_persisted_offsets(
+        self, offsets: List[Optional[Tuple[str, int, int]]]
+    ) -> None:
+        """Record the highest durable offset per partition.
+
+        Called only after PostgreSQL and the local JSONL write both succeed.
+        A failed flush must not move this boundary; the batch is re-queued and
+        its offsets stay uncommitted.
+        """
+        updated = False
+        with self._commit_lock:
+            for info in offsets:
+                if info is None:
+                    continue
+                topic, partition, next_offset = info
+                key = (topic, partition)
+                previous = self._pending_commits.get(key)
+                if previous is None or next_offset > previous:
+                    self._pending_commits[key] = next_offset
+                updated = True
+        if updated:
+            self._commit_pending.set()
+
+    def _commit_offsets(self) -> None:
+        """Commit only offsets whose events were durably stored.
+
+        ``KafkaConsumer.commit()`` without arguments commits the consumer's
+        current position, which may include messages still sitting in
+        ``batch_buffer``. Committing explicit per-partition offsets captured
+        at flush time closes that window. Partitions that are no longer
+        assigned (a rebalance happened between flush and commit) are dropped
+        from the pending map; those events will be redelivered and deduped by
+        event_id if they were already persisted.
+        """
+        with self._commit_lock:
+            pending = dict(self._pending_commits)
+
+        if not pending:
+            # No message offsets were captured (for example a batch populated
+            # directly by a test). Do not call commit() without arguments:
+            # that would acknowledge the consumer's current position, which is
+            # exactly the bug this method exists to prevent.
+            self._commit_pending.clear()
+            return
+
+        try:
+            assignment = {(tp.topic, tp.partition) for tp in self.consumer.assignment()}
+        except Exception:
+            assignment = None
+
+        if assignment is not None:
+            with self._commit_lock:
+                for key in list(self._pending_commits):
+                    if key not in assignment:
+                        del self._pending_commits[key]
+                pending = dict(self._pending_commits)
+
+        offsets = {
+            TopicPartition(topic, partition): OffsetAndMetadata(next_offset, "")
+            for (topic, partition), next_offset in pending.items()
+        }
+        if offsets:
+            self.consumer.commit(offsets=offsets)
+        self._commit_pending.clear()
 
     def _write_file_batch(self, events: List[Dict]):
         """Write batch of events to JSONL files grouped by hostname."""
@@ -1679,6 +1776,20 @@ class ASHConsumer:
         except Exception:
             pass
 
+    def _message_offset_info(self, message) -> Optional[Tuple[str, int, int]]:
+        """Return (topic, partition, next_offset) for a Kafka message.
+
+        Fake consumers in unit tests may not expose the Kafka message API;
+        returning None keeps the legacy commit path for those callers.
+        """
+        try:
+            offset = message.offset()
+            if offset is None:
+                return None
+            return (message.topic(), message.partition(), int(offset) + 1)
+        except Exception:
+            return None
+
     def run(self):
         """Main consumer loop."""
         self.logger.info(
@@ -1695,6 +1806,7 @@ class ASHConsumer:
                 self._last_message_at = now
                 LAST_MESSAGE_TIMESTAMP.set(now)
                 raw_text, event, error = self._decode_message(message.value)
+                offset_info = self._message_offset_info(message)
                 with self._processing_lock:
                     if error:
                         self.logger.warning(
@@ -1702,7 +1814,11 @@ class ASHConsumer:
                         )
                         self._write_dead_letter_raw(raw_text, error)
                     else:
-                        self.process_message(event, raw_event_text=raw_text)
+                        self.process_message(
+                            event,
+                            raw_event_text=raw_text,
+                            offset_info=offset_info,
+                        )
 
                     self._update_lag()
 
@@ -1712,8 +1828,7 @@ class ASHConsumer:
                     # and the _commit_pending.set() call in _flush_batch().
                     if self._commit_pending.is_set():
                         try:
-                            self.consumer.commit()
-                            self._commit_pending.clear()
+                            self._commit_offsets()
                         except Exception as e:
                             self.logger.error(f"Offset commit failed: {e}")
 
@@ -1746,8 +1861,7 @@ class ASHConsumer:
             # as run()'s loop (called from its `finally`), so this is safe.
             if hasattr(self, "consumer") and self._commit_pending.is_set():
                 try:
-                    self.consumer.commit()
-                    self._commit_pending.clear()
+                    self._commit_offsets()
                 except Exception as e:
                     self.logger.error(f"Final offset commit failed: {e}")
 
