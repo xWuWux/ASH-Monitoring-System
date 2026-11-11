@@ -15,34 +15,37 @@ roughly 16.7k command rows, which keeps the time-window queries selective.
 | `stats_top_commands` | `GET /api/v1/stats/top-commands?hours=24&limit=20` |
 | `sessions` | `GET /api/v1/sessions?limit=50` |
 
-Each endpoint has its own target threshold:
+Each endpoint has its own threshold:
 
-- average response time `< 200 ms`
-- p95 `< 500 ms`
-- failed requests `< 1%`
-- checks (status 200 + JSON content type) `> 99%`
-
-The first 2–3 main runs are **report-only**: CI sets `K6_ENFORCE=false`, so
-the same metrics are collected without failing the job. Once a baseline proves
-the gates are achievable on the runner, set `K6_ENFORCE=true` in `ci.yml`.
-When enforced, k6 exits non-zero on a threshold failure.
+- **Always enforced:** failed requests `< 1%`, checks (status 200 + JSON
+  content type) `> 99%`. A 503/timeout/non-JSON response fails the run even
+  during latency calibration.
+- **Latency targets, report-only during calibration:** average `< 200 ms`,
+  p95 `< 500 ms`. The first 2–3 main runs set `K6_ENFORCE=false`; once a
+  baseline proves the latency targets are achievable on the runner, set
+  `K6_ENFORCE=true` in `ci.yml`.
 
 ## Local run
 
 ```bash
-# From the repository root, with the Compose stack already running:
-docker compose -f deployments/docker/docker-compose.yml exec -T \
-  -e PGPASSWORD="$ASH_DB_PASSWORD" postgres \
-  psql -U ash -d ash_logs -v ON_ERROR_STOP=1 \
-  < tests/performance/k6/seed.sql
+# From the repository root, with the Compose stack already running. The
+# seed truncates audit tables, so it requires an explicit confirmation.
+ASH_SEED_CONFIRM=disposable \
+  docker compose -f deployments/docker/docker-compose.yml exec -T \
+    -e PGPASSWORD="$ASH_DB_PASSWORD" postgres \
+    psql -U ash -d ash_logs -v ON_ERROR_STOP=1 \
+    < tests/performance/k6/seed.sql
 
 mkdir -p k6-results
 
-ASH_API_BASE_URL=http://127.0.0.1:8080 \
-ASH_ADMIN_USER="${ASH_ADMIN_USER:?set ASH_ADMIN_USER}" \
-ASH_ADMIN_PASS="${ASH_ADMIN_PASS:?set ASH_ADMIN_PASS}" \
-K6_VUS=20 K6_DURATION=60s \
-k6 run --summary-export=k6-results/summary.json \
+k6 run \
+  -e ASH_API_BASE_URL=http://127.0.0.1:8080 \
+  -e ASH_ADMIN_USER="${ASH_ADMIN_USER:?set ASH_ADMIN_USER}" \
+  -e ASH_ADMIN_PASS="${ASH_ADMIN_PASS:?set ASH_ADMIN_PASS}" \
+  -e K6_VUS=20 \
+  -e K6_DURATION=60s \
+  -e K6_ENFORCE=false \
+  --summary-export=k6-results/summary.json \
   tests/performance/k6/api-load.js
 ```
 

@@ -38,15 +38,22 @@ const ENDPOINTS = [
 // p95 < 500 ms, and < 1% failures at 20 VUs. These are intentionally strict;
 // if the shared GitHub runner cannot meet them with 500k seeded rows, report
 // the measured values rather than silently weakening the gate.
-const thresholds = {};
+const correctnessThresholds = {};
+const latencyThresholds = {};
 const endpointMetrics = {};
 for (const endpoint of ENDPOINTS) {
-    thresholds[`http_req_duration{endpoint:${endpoint.name}}`] = [
+    // Correctness is always enforced, even during latency calibration. A 503
+    // or a non-JSON response must fail the run; only the latency SLO is
+    // report-only while K6_ENFORCE=false.
+    correctnessThresholds[`http_req_failed{endpoint:${endpoint.name}}`] = [
+        "rate<0.01",
+    ];
+    correctnessThresholds[`checks{endpoint:${endpoint.name}}`] = ["rate>0.99"];
+    latencyThresholds[`http_req_duration{endpoint:${endpoint.name}}`] = [
         "avg<200",
         "p(95)<500",
     ];
-    thresholds[`http_req_failed{endpoint:${endpoint.name}}`] = ["rate<0.01"];
-    thresholds[`checks{endpoint:${endpoint.name}}`] = ["rate>0.99"];
+
     // The built-in tagged metrics are not included in --summary-export on
     // this k6 version. Custom per-endpoint Trend/Rate metrics make the
     // baseline visible in k6-results/summary.json and in the threshold
@@ -55,12 +62,17 @@ for (const endpoint of ENDPOINTS) {
         duration: new Trend(`endpoint_duration_${endpoint.name}`, true),
         failed: new Rate(`endpoint_failed_${endpoint.name}`),
     };
-    thresholds[`endpoint_duration_${endpoint.name}`] = [
+    correctnessThresholds[`endpoint_failed_${endpoint.name}`] = ["rate<0.01"];
+    latencyThresholds[`endpoint_duration_${endpoint.name}`] = [
         "avg<200",
         "p(95)<500",
     ];
-    thresholds[`endpoint_failed_${endpoint.name}`] = ["rate<0.01"];
 }
+
+const thresholds = {
+    ...correctnessThresholds,
+    ...(ENFORCE_THRESHOLDS ? latencyThresholds : {}),
+};
 
 export const options = {
     scenarios: {
@@ -70,7 +82,7 @@ export const options = {
             duration: DURATION,
         },
     },
-    thresholds: ENFORCE_THRESHOLDS ? thresholds : {},
+    thresholds,
 };
 
 export function setup() {

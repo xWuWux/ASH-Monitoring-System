@@ -13,7 +13,10 @@
 services:
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.9.0
-    command: ["-config", "/etc/toxiproxy/toxiproxy.json"]
+    # The image entrypoint is /toxiproxy and its default Cmd contains
+    # -host=0.0.0.0. Replacing Cmd with only -config drops that flag and binds
+    # the admin API to localhost, so host-side curls cannot reach it.
+    command: ["-host=0.0.0.0", "-config", "/etc/toxiproxy/toxiproxy.json"]
     volumes:
       - ./toxiproxy.json:/etc/toxiproxy/toxiproxy.json:ro
     ports:

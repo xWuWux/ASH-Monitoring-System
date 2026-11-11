@@ -87,16 +87,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r src/consumer/requirements.txt pytest "mutmut==3.8.1"
 
-      - name: Run mutation testing (120-minute cap, report-only baseline)
-        # Report-only until a mutation-score threshold is agreed. A timeout or
-        # tool failure should still produce the artifacts below, not a red
-        # nightly for a quality metric that has no gate yet.
-        continue-on-error: true
+      - name: Run mutation testing (120-minute cap)
+        # The mutation *score* is report-only until a threshold is agreed, but
+        # a mutmut crash or a timeout must not be hidden: those mean the
+        # experiment did not run. mutmut exits 0 even with surviving mutants,
+        # so only tool failures and timeout exit non-zero here.
         run: |
           # setup.cfg limits mutmut to src/consumer and tests/unit/python.
           # DB/Kafka integration suites are excluded; those cannot run once
           # per mutant without provisioning services.
+          set +e
           timeout 7200 mutmut run
+          rc=$?
+          set -e
+          if [ "$rc" -eq 124 ]; then
+            echo "mutation run exceeded the 120-minute cap" >&2
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "mutmut failed with exit code $rc" >&2
+            exit "$rc"
+          fi
 
       - name: Collect mutation results
         if: always()

@@ -27,18 +27,22 @@ about what is implemented, what is deferred, and what still needs a decision.
   - `/api/v1/sessions?limit=50`
 - **Load:** 20 constant VUs for 60 seconds; each VU cycles through all
   endpoints with 100 ms think time.
-- **Target gates (report-only during calibration):** average `< 200 ms`,
-  p95 `< 500 ms`, failed requests `< 1%`, checks `> 99%` per endpoint. The
-  first 2–3 main runs are **report-only** (`K6_ENFORCE=false`) so the
-  baseline can be measured without a red main; flip `K6_ENFORCE=true` in
-  `ci.yml` once three consecutive main runs show p95 below the gate with
-  margin. Do not call them enforced while `K6_ENFORCE=false`.
+- **Correctness gates (always enforced):** failed requests `< 1%` and
+  checks `> 99%` per endpoint. A 503, timeout, or non-JSON response fails
+  the run even while latency is in calibration.
+- **Latency target gates (report-only during calibration):** average
+  `< 200 ms`, p95 `< 500 ms` per endpoint. The first 2–3 main runs run with
+  `K6_ENFORCE=false`; flip `K6_ENFORCE=true` in `ci.yml` once three
+  consecutive main runs show p95 below the gate with margin. Do not call
+  the latency gates enforced while `K6_ENFORCE=false`.
 - **Seed:** `tests/performance/k6/seed.sql` inserts 500,000 `command_logs`
   rows over 30 days (20 hosts, ~16.7k in the last 24 hours), 20,000
   `sessions`, and 50,000 `file_changes`. Spreading the rows makes the
   24-hour window selective for `idx_cmd_logs_log_timestamp`; a dense 500k
   window defeats that index and turns the test into a worst-case seq scan.
-  The seed **truncates** the tables and is test-only.
+  The seed **truncates** the tables and is test-only. CI requires
+  `ASH_SEED_CONFIRM=disposable`, and the destructive work runs in one
+  transaction; a failed insert cannot leave a half-truncated dataset.
 - **CI trigger:** existing `ephemeral-deploy-benchmarks` job, which runs on
   push to `main` and manual dispatch. It is not in the required-to-merge
   chain, so PR time is unaffected.
@@ -52,8 +56,8 @@ The 24-hour aggregate endpoints are the likely bottleneck, not the events
 list: `/api/v1/hosts` (`COUNT(DISTINCT session_id)`), `/api/v1/stats/timeline`
 and `/api/v1/stats/top-commands` group 500k rows. The k6 events request has no
 `command` filter, so the `ILIKE` path is not exercised by this load test. With
-500k rows the hard `avg < 200 ms` gate may fail on a 2-core GitHub runner even
-after the seed correlates `session_id` with the 20k seeded sessions. If it
+500k rows the `avg < 200 ms` latency target may fail on a 2-core GitHub runner
+even after the seed correlates `session_id` with the 20k seeded sessions. If it
 fails, do not silently relax the threshold: capture the measured p50/p95, add
 the missing time/aggregate index or rewrite the query, and re-baseline. The
 gate is intentionally strict because it is the requested SLO; the first 2–3
@@ -93,10 +97,14 @@ failure gate covers 5xx/503, timeouts, and non-JSON responses.
   `deployments/docker/toxiproxy.json`.
   - Toxiproxy proxies the API's PostgreSQL connection only; the consumer
     keeps its direct connection.
-  - The script injects 200 ms ± 50 ms latency, asserts the API still returns
-    200 and that latency increased, removes the toxic, then stops PostgreSQL
-    and asserts `/health/ready` and `/api/v1/events` return 503. It starts
-    PostgreSQL again and asserts 200 without an API restart.
+  - The script waits for the authenticated data path (the consumer creates
+    the schema after `/health/ready` is already true), then injects
+    200 ms ± 50 ms latency, asserts HTTP 200 and that latency increased,
+    removes the toxic, and stops PostgreSQL. It asserts `/health/ready` and
+    `/api/v1/events` return 503 within a wall-clock deadline, then starts
+    PostgreSQL and asserts 200 without an API restart. The latency ceiling
+    is 3 s because the API opens a new DB connection per request and runs two
+    queries; 1 s was not reachable for this endpoint.
 - **What is not implemented:** real DB failover (Compose has one PostgreSQL,
   no replica), Kafka outage/reconnect in this script, Chaos Mesh (requires
   Kubernetes), and Toxiproxy on the consumer→Kafka link. The script name and
@@ -119,10 +127,11 @@ failure gate covers 5xx/503, timeouts, and non-JSON responses.
   PostgreSQL or Kafka; running them once per mutant is impractical. The unit
   suite mocks those services.
 - **Runtime:** nightly job, `timeout 7200 mutmut run` (120-minute cap),
-  artifacts uploaded. The job is **report-only** (`continue-on-error`) until
-  a mutation-score threshold is agreed; the first runs are for baseline and
-  triage. `mutmut run` exits 0 even with surviving mutants, so a green job
-  without a parsed score is not a quality signal.
+  artifacts uploaded. The mutation **score** is report-only until a
+  threshold is agreed, but tool failures and the 120-minute timeout fail the
+  job (they mean the experiment did not run). `mutmut run` exits 0 even with
+  surviving mutants, so a green job without a parsed score is not a quality
+  signal.
 - **Known risk:** mutmut 3.x may not support every Python 3.12 feature used
   by the consumer; if the first run fails during collection, pin the last
   working mutmut version and document it.

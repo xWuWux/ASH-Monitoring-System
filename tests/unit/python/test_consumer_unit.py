@@ -5,6 +5,7 @@ import time
 
 import psycopg2
 import pytest
+from kafka.structs import OffsetAndMetadata, TopicPartition
 
 
 def test_constructor_creates_log_dir_before_configuring_logging(
@@ -503,8 +504,20 @@ def test_database_outage_marks_the_gauge_unavailable(
 
 
 class _Message:
-    def __init__(self, value):
+    def __init__(self, value, offset=0, topic="ash-logs", partition=0):
         self.value = value
+        self._offset = offset
+        self._topic = topic
+        self._partition = partition
+
+    def topic(self):
+        return self._topic
+
+    def partition(self):
+        return self._partition
+
+    def offset(self):
+        return self._offset
 
 
 class _FakeKafkaConsumer:
@@ -512,6 +525,7 @@ class _FakeKafkaConsumer:
         self._messages = iter(messages)
         self._failure = failure
         self.commits = 0
+        self.committed_offsets = []
         self.closed = False
 
     def __iter__(self):
@@ -525,8 +539,12 @@ class _FakeKafkaConsumer:
     def metrics(self):
         return {"records-lag-max": 7.0}
 
-    def commit(self):
+    def assignment(self):
+        return {TopicPartition("ash-logs", 0)}
+
+    def commit(self, offsets=None):
         self.commits += 1
+        self.committed_offsets.append(offsets)
 
     def close(self):
         self.closed = True
@@ -590,3 +608,66 @@ def test_flush_timer_flushes_under_the_processing_lock(
     consumer._start_flush_timer()
 
     assert flushed == [True]
+
+
+def test_run_commits_only_offsets_persisted_by_each_flush(
+    consumer_factory, event_factory
+):
+    """A flush must not acknowledge a later message still in the buffer."""
+    consumer = consumer_factory(batch_size=1)
+    event_a = event_factory(command="event-A")
+    event_b = event_factory(command="event-B")
+    fake = _FakeKafkaConsumer(
+        [
+            _Message(json.dumps(event_a).encode(), offset=0),
+            _Message(json.dumps(event_b).encode(), offset=1),
+        ]
+    )
+    consumer.consumer = fake
+
+    consumer.run()
+
+    assert fake.commits == 2
+    assert fake.committed_offsets[0] == {
+        TopicPartition("ash-logs", 0): OffsetAndMetadata(1, "")
+    }
+    assert fake.committed_offsets[1] == {
+        TopicPartition("ash-logs", 0): OffsetAndMetadata(2, "")
+    }
+
+
+def test_failed_flush_does_not_record_offsets(consumer_factory, event_factory):
+    consumer = consumer_factory()
+    consumer.batch_buffer = [event_factory()]
+    consumer.batch_raw_texts = [None]
+    consumer.batch_offsets = [("ash-logs", 0, 9)]
+
+    def fail_file_write(_events):
+        raise RuntimeError("disk full")
+
+    consumer._write_file_batch = fail_file_write
+
+    consumer._flush_batch()
+
+    assert consumer._pending_commits == {}
+    assert not consumer._commit_pending.is_set()
+    assert consumer.batch_offsets == [("ash-logs", 0, 9)]
+
+
+def test_commit_drops_offsets_for_revoked_partitions(consumer_factory, event_factory):
+    consumer = consumer_factory()
+    consumer._pending_commits = {("ash-logs", 0): 3}
+    consumer._commit_pending.set()
+
+    class _RevokedConsumer:
+        def assignment(self):
+            return set()
+
+        def commit(self, offsets=None):
+            raise AssertionError("must not commit a revoked partition")
+
+    consumer.consumer = _RevokedConsumer()
+    consumer._commit_offsets()
+
+    assert consumer._pending_commits == {}
+    assert not consumer._commit_pending.is_set()

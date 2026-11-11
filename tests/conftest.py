@@ -82,12 +82,15 @@ def _build_consumer(module, tmp_path: Path, **overrides):
     consumer.max_seen_ids = consumer.config["max_dedup_cache"]
     consumer.batch_buffer = []
     consumer.batch_raw_texts = []
+    consumer.batch_offsets = []
     consumer.batch_size = consumer.config["batch_size"]
     consumer.batch_timeout = consumer.config["batch_timeout"]
     consumer.last_flush = time.time()
     consumer.batch_lock = threading.Lock()
     consumer._processing_lock = threading.Lock()
     consumer._commit_pending = threading.Event()
+    consumer._pending_commits = {}
+    consumer._commit_lock = threading.Lock()
 
     consumer.log_dir = log_dir
     consumer.dlq_path = log_dir / "dead_letter.jsonl"

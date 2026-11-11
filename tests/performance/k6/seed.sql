@@ -11,6 +11,11 @@
 -- must group the last 24 hours. The ILIKE search path is not exercised
 -- because the load request has no command filter.
 
+-- The caller must explicitly confirm this is a disposable database (the CI
+-- step requires ASH_SEED_CONFIRM=disposable). Keep the destructive work in
+-- one transaction so a failed insert cannot leave a half-truncated dataset.
+BEGIN;
+
 TRUNCATE TABLE alerts, command_logs, file_changes, sessions RESTART IDENTITY;
 
 INSERT INTO sessions (
@@ -106,6 +111,8 @@ SELECT
     'bench-command-' || (i % 5000),
     'bash-diff'
 FROM generate_series(1, 50000) AS g(i);
+
+COMMIT;
 
 ANALYZE command_logs;
 ANALYZE sessions;
